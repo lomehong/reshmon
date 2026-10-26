@@ -170,12 +170,35 @@ func render(a *app.App) {
 		}
 	}
 
+	// 采集降级与运行错误必须可见：写盘失败/GPU 计数器缺失不能静默
+	if degr := degradeLines(snap, a); len(degr) > 0 {
+		b.WriteString("\n" + cYel)
+		for _, d := range degr {
+			fmt.Fprintf(&b, "⚠ %s\n", d)
+		}
+		b.WriteString(cReset)
+	}
+
 	b.WriteString("\n" + cDim + "数据目录 " + a.Cfg.DataDir)
 	if !a.Cfg.Record {
 		b.WriteString("（未记录）")
 	}
 	b.WriteString("  ·  Ctrl+C 退出" + cReset + "\n")
 	os.Stdout.WriteString(b.String())
+}
+
+func degradeLines(snap *model.Snapshot, a *app.App) []string {
+	var out []string
+	for _, e := range snap.CapErrors {
+		out = append(out, "采集降级："+e)
+	}
+	for _, e := range a.Errs() {
+		out = append(out, e)
+	}
+	if len(out) > 4 {
+		out = out[len(out)-4:]
+	}
+	return out
 }
 
 func lbl(letters, id string) string {

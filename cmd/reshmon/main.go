@@ -4,8 +4,8 @@
 //
 // 用法：
 //
-//	reshmon once    [-json] [-obs 800ms]      单次采样并打印（退出码 0/1/2 = 健康/亚健康/饱和）
-//	reshmon live    [--data D] [--no-record]  终端实时面板（默认记录历史）
+//	reshmon once    [-json] [-obs 800ms]      单次采样并打印（退出码 0/1/2=健康/亚健康/饱和，3=执行错误）
+//	reshmon live    [--data D] [--no-record] [--interval 1s]  终端实时面板（默认记录历史）
 //	reshmon serve   [--addr 127.0.0.1:8964]   Web 面板 + 常驻记录
 //	reshmon report  [--day 2026-10-26 | --last 24h]  回溯分析历史
 //	reshmon version
@@ -29,20 +29,25 @@ import (
 	"github.com/lomehong/reshmon/internal/webui"
 )
 
-const version = "0.1.0"
-
 func main() {
 	syswin.SetupConsole()
 	if len(os.Args) < 2 {
 		usage()
-		os.Exit(2)
+		os.Exit(3)
 	}
 	var err error
 	switch os.Args[1] {
 	case "once":
-		err = cmdOnce(os.Args[2:])
+		code, cerr := cmdOnce(os.Args[2:])
+		if cerr != nil {
+			err = cerr
+			break
+		}
+		if code != 0 {
+			os.Exit(code) // cmdOnce 的 defer 已在其 return 时执行完
+		}
 	case "version":
-		fmt.Println("reshmon", version)
+		fmt.Println("reshmon", app.Version)
 	case "live":
 		err = cmdLive(os.Args[2:])
 	case "serve":
@@ -54,11 +59,11 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "未知命令 %q\n\n", os.Args[1])
 		usage()
-		os.Exit(2)
+		os.Exit(3)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
-		os.Exit(1)
+		os.Exit(3)
 	}
 }
 
@@ -66,9 +71,9 @@ func usage() {
 	fmt.Print(`reshmon —— Windows 资源健康监护（CPU/内存/提交/磁盘/GPU + Agent 归因）
 
 用法:
-  reshmon once    [-json] [-obs 800ms] [-data 目录]     单次采样打印，退出码 0/1/2=健康/亚健康/饱和
-  reshmon live    [-data 目录] [-no-record]             终端实时面板
-  reshmon serve   [-addr 127.0.0.1:8964] [-data 目录]   Web 面板（默认同时记录历史）
+  reshmon once    [-json] [-obs 800ms] [-data 目录]     单次采样打印，退出码 0/1/2=健康/亚健康/饱和，3=执行错误
+  reshmon live    [-data 目录] [-no-record] [-interval 1s]   终端实时面板
+  reshmon serve   [-addr 127.0.0.1:8964] [-data 目录] [-no-record] [-interval 1s]   Web 面板（默认同时记录历史）
   reshmon report  [-day 2026-10-26 | -last 24h]         回溯分析已记录的历史
   reshmon version
 
@@ -77,17 +82,22 @@ func usage() {
 }
 
 // cmdOnce 单次采样：双帧采集（PDH 速率需要两帧 + 进程差分），obs 为观察窗。
-func cmdOnce(args []string) error {
+// 退出码与 README 契约一致：0=健康 1=亚健康 2=饱和——JSON 输出同样适用
+// （健康结论编码在输出的 health 字段，脚本两种方式都能接）。
+func cmdOnce(args []string) (int, error) {
 	fs := flag.NewFlagSet("once", flag.ExitOnError)
 	obs := fs.Duration("obs", 800*time.Millisecond, "观察窗时长（差分基线）")
 	asJSON := fs.Bool("json", false, "输出 JSON（机器可读）")
 	dataDir := fs.String("data", "", "数据目录（读 agents.json/config.json）")
 	_ = fs.Parse(args)
 
-	cfg := app.LoadConfig(*dataDir)
+	cfg, warns := app.LoadConfig(*dataDir)
+	for _, w := range warns {
+		fmt.Fprintln(os.Stderr, "⚠", w)
+	}
 	s, err := sampler.New(*obs, cfg.Patterns)
 	if err != nil {
-		return err
+		return 3, err
 	}
 	defer s.Close()
 	s.Tick() // 基线帧
@@ -95,17 +105,21 @@ func cmdOnce(args []string) error {
 	snap := s.Tick()
 
 	rep := health.NewJudge(cfg.Thresholds, 1).Evaluate([]model.Totals{app.TotalsFrom(snap)})
+	health.ApplyDegrade(&rep, snap.CapErrors)
 	if *asJSON {
-		return printJSON(snap, rep)
+		if err := printJSON(snap, rep); err != nil {
+			return 3, err
+		}
+	} else {
+		printHuman(snap, rep)
 	}
-	printHuman(snap, rep)
 	switch rep.Overall {
 	case model.StatusSat:
-		os.Exit(2)
+		return 2, nil
 	case model.StatusWarn:
-		os.Exit(1)
+		return 1, nil
 	}
-	return nil
+	return 0, nil
 }
 
 type onceJSON struct {
@@ -239,16 +253,21 @@ func cmdLive(args []string) error {
 	interval := fs.Duration("interval", 0, "采样间隔（默认读 config，初始 2s）")
 	_ = fs.Parse(args)
 
-	cfg := app.LoadConfig(*dataDir)
+	cfg, warns := app.LoadConfig(*dataDir)
 	if *noRecord {
 		cfg.Record = false
 	}
 	if *interval > 0 {
 		cfg.Interval = *interval
+		cfg.DeriveForInterval()
 	}
 	a, err := app.Start(cfg)
 	if err != nil {
 		return err
+	}
+	for _, w := range warns {
+		fmt.Fprintln(os.Stderr, "⚠", w)
+		a.AddErr(w)
 	}
 	defer a.Close()
 	return tui.Run(a, cfg.Interval)
@@ -263,20 +282,25 @@ func cmdServe(args []string) error {
 	interval := fs.Duration("interval", 0, "采样间隔（默认读 config，初始 2s）")
 	_ = fs.Parse(args)
 
-	cfg := app.LoadConfig(*dataDir)
+	cfg, warns := app.LoadConfig(*dataDir)
 	if *noRecord {
 		cfg.Record = false
 	}
 	if *interval > 0 {
 		cfg.Interval = *interval
+		cfg.DeriveForInterval()
 	}
 	a, err := app.Start(cfg)
 	if err != nil {
 		return err
 	}
+	for _, w := range warns {
+		fmt.Fprintln(os.Stderr, "⚠", w)
+		a.AddErr(w)
+	}
 	defer a.Close()
 
-	fmt.Printf("reshmon %s 面板: http://%s/   (Ctrl+C 停止)\n数据目录: %s   历史记录: %v\n", version, *addr, cfg.DataDir, cfg.Record)
+	fmt.Printf("reshmon %s 面板: http://%s/   (Ctrl+C 停止)\n数据目录: %s   历史记录: %v\n", app.Version, *addr, cfg.DataDir, cfg.Record)
 	return webui.Serve(a, *addr)
 }
 
@@ -288,7 +312,10 @@ func cmdReport(args []string) error {
 	last := fs.Duration("last", 0, "分析最近时长，如 24h / 6h（优先于 -day）")
 	_ = fs.Parse(args)
 
-	cfg := app.LoadConfig(*dataDir)
+	cfg, warns := app.LoadConfig(*dataDir)
+	for _, w := range warns {
+		fmt.Fprintln(os.Stderr, "⚠", w)
+	}
 	now := time.Now()
 	var from, to time.Time
 	if *last > 0 {

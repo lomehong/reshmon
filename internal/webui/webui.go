@@ -7,8 +7,10 @@ package webui
 import (
 	_ "embed"
 	"encoding/json"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"time"
@@ -22,16 +24,46 @@ import (
 //go:embed index.html
 var indexHTML []byte
 
-const version = "0.1.0"
-
-// Serve 启动面板（阻塞）。
+// Serve 启动面板（阻塞，Ctrl+C 优雅退出）。
 func Serve(a *app.App, addr string) error {
-	srv := &http.Server{Addr: addr, Handler: Handler(a), ReadHeaderTimeout: 5 * time.Second}
-	return srv.ListenAndServe()
+	srv := &http.Server{Addr: addr, Handler: HandlerWithAddr(a, addr), ReadHeaderTimeout: 5 * time.Second}
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	select {
+	case err := <-errCh:
+		if err == http.ErrServerClosed {
+			return nil
+		}
+		return err
+	case <-sig:
+		// 优雅退出：让 main 的 defer 链（App.Close 释放句柄与目录锁）执行
+		_ = srv.Close()
+		return nil
+	}
 }
 
-// Handler 面板路由。
-func Handler(a *app.App) http.Handler {
+// Handler 面板路由（不做 Host 校验，测试用）。
+func Handler(a *app.App) http.Handler { return handler(a, nil) }
+
+// HandlerWithAddr 按监听地址构造路由；绑定回环地址时启用 Host 白名单
+// （防 DNS rebinding：恶意网页把域名重绑到 127.0.0.1 后借浏览器同源
+// 读走全量进程表）。绑定 0.0.0.0 等通配地址属用户主动暴露，不做校验，
+// 风险见 README。
+func HandlerWithAddr(a *app.App, addr string) http.Handler {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host == "" || host == "0.0.0.0" || host == "::" {
+		return handler(a, nil)
+	}
+	allowed := map[string]bool{
+		addr: true, host + ":" + port: true,
+		"127.0.0.1:" + port: true, "localhost:" + port: true, "[::1]:" + port: true,
+	}
+	return handler(a, allowed)
+}
+
+func handler(a *app.App, allowedHosts map[string]bool) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -60,7 +92,7 @@ func Handler(a *app.App) http.Handler {
 				"host":      host,
 				"uptimeSec": syswin.UptimeMs() / 1000,
 				"cores":     snap.CPU.Cores,
-				"version":   version,
+				"version":   app.Version,
 				"dataDir":   a.Cfg.DataDir,
 				"record":    a.Cfg.Record,
 			},
@@ -73,7 +105,7 @@ func Handler(a *app.App) http.Handler {
 			"agents":    snap.Agents,
 			"procs":     procs,
 			"capErrors": snap.CapErrors,
-			"errors":    a.Errors,
+			"errors":    a.Errs(),
 		}
 		writeJSON(w, resp)
 	})
@@ -84,7 +116,8 @@ func Handler(a *app.App) http.Handler {
 			sec = v
 		}
 		cutoff := time.Now().Add(-time.Duration(sec) * time.Second).UnixMilli()
-		est := sec/int(a.Cfg.Interval.Seconds()) + 8
+		// 按真实间隔换算（浮点）：interval<1s 时整型除法会除零 panic
+		est := int(float64(sec)/a.Cfg.Interval.Seconds()) + 8
 		if est < 8 {
 			est = 8
 		}
@@ -115,22 +148,30 @@ func Handler(a *app.App) http.Handler {
 		if v, err := strconv.Atoi(r.URL.Query().Get("n")); err == nil && v > 0 && v <= 500 {
 			n = v
 		}
-		incs, err := store.LoadIncidents(a.Cfg.DataDir, time.Now().Add(-7*24*time.Hour), time.Now().Add(time.Minute))
-		if err != nil {
-			incs = nil
+		// 全走内存（启动时已回放历史文件）：不再每个轮询周期全量读盘解析
+		cutoff := time.Now().Add(-7 * 24 * time.Hour).UnixMilli()
+		all := a.Incidents()
+		incs := make([]store.Incident, 0, n)
+		for _, inc := range all {
+			if inc.T >= cutoff {
+				incs = append(incs, inc)
+			}
 		}
 		if len(incs) > n {
 			incs = incs[len(incs)-n:]
 		}
-		// 内存中的最近事件兜底（未开启记录时也有）
-		if len(incs) == 0 {
-			for _, inc := range a.Incidents() {
-				incs = append(incs, inc)
-			}
-		}
 		writeJSON(w, map[string]any{"incidents": incs})
 	})
 
+	if allowedHosts != nil {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !allowedHosts[r.Host] {
+				http.Error(w, "forbidden host", http.StatusForbidden)
+				return
+			}
+			mux.ServeHTTP(w, r)
+		})
+	}
 	return mux
 }
 

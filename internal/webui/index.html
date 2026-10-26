@@ -122,7 +122,7 @@ function sparkKey(key){
     if(key==="cpu")return t.cpu;
     if(key==="memp")return t.memp;
     if(key==="commit")return t.commit;
-    if(key&&key.startsWith("disk:")){const d=(t.disks||[]).find(x=>x.id===key.slice(5));return d?d.busy:null}
+    if(key&&key.startsWith("disk:")){const kk=key.slice(5);const d=(t.disks||[]).find(x=>(x.id||"").split(" ")[0]===kk);return d?d.busy:null}
     if(key&&key.startsWith("gpu:")){const g=(t.gpus||[]).find(x=>x.k===key.slice(4));return g?g.u:null}
     return null}).filter(v=>v!=null);
 }
@@ -132,15 +132,15 @@ function dimMap(){const m={};((SNAP&&SNAP.health&&SNAP.health.dims)||[]).forEach
 
 function renderCards(){
   const box=$("#cards");box.innerHTML="";
-  if(!SNAP)return;
+  if(!SNAP||SNAP.starting||!SNAP.cpu)return; // 启动前 1-2s 静默等待，不算错误
   const hs=dimMap(),cards=[];
   cards.push({k:"cpu",st:hs.cpu,name:"CPU",val:pct(SNAP.cpu.busyPct),sub:SNAP.cpu.cores+" 核",v:SNAP.cpu.busyPct});
   const m=SNAP.mem;
   cards.push({k:"memp",st:hs.mem,name:"内存",val:pct(m.physUsedPct),sub:fmtB(m.physTotalB)+" 物理 · 可用 "+fmtB(m.physAvailB),v:m.physUsedPct});
   cards.push({k:"commit",st:hs.commit,name:"提交内存",val:pct(m.commitPct),sub:fmtB(m.commitTotalB)+" / "+fmtB(m.commitLimitB),v:m.commitPct});
-  (SNAP.disks||[]).forEach(d=>cards.push({k:"disk:"+d.id,st:hs["disk:"+d.id],name:"磁盘 "+(d.l||d.id),val:pct(d.busy),
-    sub:"读 "+fmtB(d.rb)+"/s · 写 "+fmtB(d.wb)+"/s · "+(d.rms+d.wms).toFixed(1)+"ms",v:d.busy}));
-  (SNAP.gpus||[]).forEach(g=>cards.push({k:"gpu:"+g.name,st:hs["gpu:"+g.name],name:"GPU "+g.name,val:pct(g.utilCapPct),
+  (SNAP.disks||[]).forEach(d=>{const dk=(d.id||"").split(" ")[0]||d.id;cards.push({k:"disk:"+dk,st:hs["disk:"+dk],name:"磁盘 "+(d.l||d.id),val:pct(d.busy),
+    sub:"读 "+fmtB(d.rb)+"/s · 写 "+fmtB(d.wb)+"/s · "+(d.rms+d.wms).toFixed(1)+"ms",v:d.busy})});
+  (SNAP.gpus||[]).forEach(g=>cards.push({k:"gpu:"+g.luid,st:hs["gpu:"+g.luid],name:"GPU "+g.name,val:pct(g.utilCapPct),
     sub:g.dedTotalB?("显存 "+fmtB(g.dedUsedB)+" / "+fmtB(g.dedTotalB)):"共享 "+fmtB(g.shUsedB),v:g.utilCapPct}));
   box.innerHTML=cards.map((c,i)=>`<div class="card ${stCls[c.st]||"ok"}">
     <div class="name">${esc(c.name)}</div>
@@ -172,10 +172,10 @@ function chartSeries(){
     let i=0;ids.forEach((l,id)=>out.push({label:"磁盘 "+(l||id),color:PAL[i++%PAL.length],
       data:HIST.map(t=>{const d=(t.disks||[]).find(x=>x.id===id);return d?[t.t,d.busy]:null}).filter(Boolean),max:100}));
   }else if(METRIC==="gpu:*"){
-    const names=new Set();
-    HIST.forEach(t=>(t.gpus||[]).forEach(g=>names.add(g.k)));
-    let i=0;names.forEach(n=>out.push({label:"GPU "+n,color:PAL[i++%PAL.length],
-      data:HIST.map(t=>{const g=(t.gpus||[]).find(x=>x.k===n);return g?[t.t,g.u]:null}).filter(Boolean),max:100}));
+    const names=new Map();
+    HIST.forEach(t=>(t.gpus||[]).forEach(g=>names.set(g.k,g.n||g.k)));
+    let i=0;names.forEach((n,k)=>out.push({label:"GPU "+n,color:PAL[i++%PAL.length],
+      data:HIST.map(t=>{const g=(t.gpus||[]).find(x=>x.k===k);return g?[t.t,g.u]:null}).filter(Boolean),max:100}));
   }
   return out;
 }
@@ -249,6 +249,7 @@ function renderIncidents(incs){
 }
 
 function renderHeader(){
+  if(!SNAP||SNAP.starting){$("#hostline").textContent="采样启动中…";return}
   const st=SNAP&&SNAP.health?SNAP.health.overall:"ok";
   const b=$("#overall");
   b.textContent=stCN[st]||st;b.className="badge "+(stCls[st]||"ok");
