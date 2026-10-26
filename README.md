@@ -61,13 +61,23 @@ Ctrl+C 退出；默认同样记录历史。参数：`-data 目录`、`-no-record
 
 ### 4. mcp —— MCP 服务器（让 Agent 自查资源后决策并发）
 
+两种接入方式：
+
+**A. Streamable HTTP（推荐，serve 已在跑时）**——面板同端口直接提供 MCP 端点 `POST /mcp`，所有 Agent 共享同一份采样与 ETW 会话：
+
+```json
+{
+  "mcpServers": {
+    "reshmon": { "url": "http://127.0.0.1:8964/mcp" }
+  }
+}
+```
+
+**B. stdio（serve 未运行时的独立兜底）**——内嵌只读采样（不落盘、不抢数据目录写锁），多个 Agent 各自启动互不干扰：
+
 ```bash
 D:\Develop\Projects\reshmon\bin\reshmon.exe mcp
 ```
-
-以 stdio 运行 [Model Context Protocol](https://modelcontextprotocol.io) 服务器，暴露 5 个工具：`resource_snapshot`（健康快照）、`agent_usage`（Agent 账本）、`top_processes`（进程 Top）、`resource_trend`（趋势摘要）、`health_events`（状态迁移）。内嵌只读采样（不落盘、不抢数据目录写锁），可与常驻 `serve` 共存，多个 Agent 各自启动互不干扰。
-
-把下面配置加进 ZCode / Claude 等 MCP 客户端即可：
 
 ```json
 {
@@ -80,7 +90,7 @@ D:\Develop\Projects\reshmon\bin\reshmon.exe mcp
 }
 ```
 
-之后 Agent 就能在发起大构建/并发任务前自己调 `resource_snapshot` 看余量，用 `agent_usage` 看自己和同伴各占多少，再决定开多大并发。
+暴露 5 个工具：`resource_snapshot`（健康快照）、`agent_usage`（Agent 账本）、`top_processes`（进程 Top）、`resource_trend`（趋势摘要）、`health_events`（状态迁移）。之后 Agent 就能在发起大构建/并发任务前自己调 `resource_snapshot` 看余量，用 `agent_usage` 看自己和同伴各占多少，再决定开多大并发。stdio 版与 serve 同时运行时，ETW 会话按「附加消费」共享（多实例不拆台，仅首个实例负责回收）。
 
 ### 5. report —— 事后回溯（"昨晚三点是谁把磁盘打满了"）
 

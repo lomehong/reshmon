@@ -14,7 +14,7 @@ import (
 )
 
 // Version 工具版本（唯一出处，CLI 与面板共用）。
-const Version = "0.2.0"
+const Version = "0.2.1"
 
 // 时长基准（窗口/频率以时间为源，间隔改变时承诺不漂移）：
 const (
