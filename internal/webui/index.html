@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>reshmon · 资源健康面板</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#c9d1d9; --dim:#8b949e;
+    --ok:#3fb950; --warn:#d29922; --crit:#f85149; --accent:#58a6ff;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  body{background:var(--bg); color:var(--text); font:13px/1.5 "Segoe UI",system-ui,sans-serif; padding:16px}
+  h1{font-size:16px; font-weight:600; display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+  h1 .sub{color:var(--dim); font-weight:400; font-size:12px}
+  .badge{display:inline-block; padding:2px 10px; border-radius:10px; font-size:12px; font-weight:600}
+  .badge.ok{background:rgba(63,185,80,.15); color:var(--ok); border:1px solid var(--ok)}
+  .badge.warn{background:rgba(210,153,34,.15); color:var(--warn); border:1px solid var(--warn)}
+  .badge.sat{background:rgba(248,81,73,.15); color:var(--crit); border:1px solid var(--crit)}
+  .cards{display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:10px; margin:14px 0}
+  .card{background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px; min-width:0}
+  .card.ok{border-color:rgba(63,185,80,.5)} .card.warn{border-color:rgba(210,153,34,.6)} .card.sat{border-color:rgba(248,81,73,.7)}
+  .card .name{color:var(--dim); font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .card .val{font-size:22px; font-weight:600; margin:2px 0}
+  .card .sub{color:var(--dim); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .card canvas{width:100%; height:30px; margin-top:6px; display:block}
+  section{background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:14px}
+  section h2{font-size:13px; font-weight:600; color:var(--dim); margin-bottom:8px; display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+  .chips{display:flex; gap:6px; flex-wrap:wrap}
+  .chip{padding:2px 10px; border-radius:12px; border:1px solid var(--border); color:var(--dim); cursor:pointer; user-select:none; font-size:12px}
+  .chip.on{color:#fff; background:var(--accent); border-color:var(--accent)}
+  table{width:100%; border-collapse:collapse; font-size:12.5px}
+  th{color:var(--dim); font-weight:500; text-align:left; padding:4px 8px; border-bottom:1px solid var(--border); cursor:pointer; white-space:nowrap}
+  th:hover{color:var(--text)}
+  td{padding:4px 8px; border-bottom:1px solid rgba(48,54,61,.4); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:340px}
+  tr:hover td{background:rgba(88,166,255,.06)}
+  td.num,th.num{text-align:right; font-variant-numeric:tabular-nums}
+  .bar{height:4px; background:#21262d; border-radius:2px; width:80px; display:inline-block; vertical-align:middle; margin-right:6px}
+  .bar i{display:block; height:100%; border-radius:2px}
+  .legend{display:flex; gap:12px; flex-wrap:wrap; font-size:11px; margin-top:6px}
+  #chart{width:100%; height:240px; display:block}
+  .inc{font-size:12px; padding:3px 0; border-bottom:1px solid rgba(48,54,61,.4)}
+  .inc time{color:var(--dim); margin-right:8px; font-variant-numeric:tabular-nums}
+  .mono{font-family:ui-monospace,Consolas,monospace}
+  footer{color:var(--dim); font-size:11px; margin-top:6px; line-height:1.7}
+  .empty{color:var(--dim); padding:8px 0}
+  .cols{display:grid; grid-template-columns:1fr 1fr; gap:14px}
+  @media(max-width:1100px){.cols{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<h1>🩺 reshmon <span id="overall" class="badge ok">—</span>
+  <span class="sub" id="hostline">加载中…</span></h1>
+
+<div class="cards" id="cards"></div>
+
+<section>
+  <h2>趋势
+    <span class="chips" id="metricChips"></span>
+    <span class="chips" id="rangeChips"></span>
+  </h2>
+  <canvas id="chart"></canvas>
+  <div class="legend" id="legend"></div>
+</section>
+
+<div class="cols">
+  <section>
+    <h2>Agent / 系统桶（按 CPU 排序）</h2>
+    <table id="agents"><thead><tr>
+      <th>名称</th><th class="num">CPU%</th><th class="num">内存(私有)</th><th class="num">磁盘 读/写</th><th class="num">GPU%</th><th class="num">显存</th><th class="num">进程</th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+  <section>
+    <h2>进程 Top（点击列头排序）</h2>
+    <table id="procs"><thead><tr>
+      <th data-k="pid">PID</th><th data-k="n">进程</th><th data-k="a">归属</th>
+      <th data-k="cpu" class="num">CPU%</th><th data-k="priv" class="num">内存</th>
+      <th data-k="io" class="num">磁盘 读/写</th><th data-k="gpu" class="num">GPU%</th><th data-k="vram" class="num">显存</th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+</div>
+
+<section>
+  <h2>健康事件（状态迁移，最近 7 天）</h2>
+  <div id="incidents"><div class="empty">暂无事件</div></div>
+</section>
+
+<footer id="footer"></footer>
+
+<script>
+"use strict";
+/* 字段口径与 Go 端 json tag 一一对应：
+   snapshot: cpu{busyPct,cores,perCore} mem{...} disks[{id,l,rb,wb,busy,q,rms,wms}]
+   gpus[{luid,name,utilPct,utilCapPct,dedUsedB,shUsedB,dedTotalB,tempC}]
+   agents[{n,cpu,priv,rb,wb,gpu,vram,p}] procs[{pid,ppid,n,a,cpu,ws,priv,rb,wb,gpu,vram}]
+   ticks: {t,cpu,memp,commit,disks[{id,l,busy}],gpus[{k,u,vp}],nr,ns}
+   incidents: {t,dim,from,to,detail} */
+const $=s=>document.querySelector(s);
+const fmtB=b=>{b=b||0;const u=["B","KB","MB","GB","TB"];let i=0;while(b>=1024&&i<4){b/=1024;i++}return b.toFixed(i&&b<100?1:0)+" "+u[i]};
+const pct=v=>(v||0).toFixed(1)+"%";
+const stCN={ok:"健康",warn:"亚健康",sat:"饱和"};
+const stCls={ok:"ok",warn:"warn",sat:"sat"};
+const PAL=["#58a6ff","#3fb950","#d29922","#f85149","#bc8cff","#39c5cf","#ff7b72","#7ee787"];
+let SNAP=null,HIST=[],METRIC="cpu",RANGE=300,SORT={k:"cpu",desc:true};
+
+function statusColor(v,warn,sat){return v>=sat?"var(--crit)":v>=warn?"var(--warn)":"var(--ok)"}
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+
+function drawSpark(cv,data,color){
+  const dpr=devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
+  cv.width=w*dpr;cv.height=h*dpr;
+  const c=cv.getContext("2d");c.scale(dpr,dpr);c.clearRect(0,0,w,h);
+  if(!data.length)return;
+  const mx=Math.max(1,...data);
+  c.beginPath();
+  data.forEach((v,i)=>{const x=i/Math.max(1,data.length-1)*w,y=h-2-(Math.min(v,mx)/mx)*(h-4);i?c.lineTo(x,y):c.moveTo(x,y)});
+  c.strokeStyle=color;c.lineWidth=1.5;c.stroke();
+}
+
+function sparkKey(key){
+  return HIST.map(t=>{
+    if(key==="cpu")return t.cpu;
+    if(key==="memp")return t.memp;
+    if(key==="commit")return t.commit;
+    if(key&&key.startsWith("disk:")){const d=(t.disks||[]).find(x=>x.id===key.slice(5));return d?d.busy:null}
+    if(key&&key.startsWith("gpu:")){const g=(t.gpus||[]).find(x=>x.k===key.slice(4));return g?g.u:null}
+    return null}).filter(v=>v!=null);
+}
+function sparkColor(idx){return PAL[idx%PAL.length]}
+
+function dimMap(){const m={};((SNAP&&SNAP.health&&SNAP.health.dims)||[]).forEach(d=>m[d.key]=d.status);return m}
+
+function renderCards(){
+  const box=$("#cards");box.innerHTML="";
+  if(!SNAP)return;
+  const hs=dimMap(),cards=[];
+  cards.push({k:"cpu",st:hs.cpu,name:"CPU",val:pct(SNAP.cpu.busyPct),sub:SNAP.cpu.cores+" 核",v:SNAP.cpu.busyPct});
+  const m=SNAP.mem;
+  cards.push({k:"memp",st:hs.mem,name:"内存",val:pct(m.physUsedPct),sub:fmtB(m.physTotalB)+" 物理 · 可用 "+fmtB(m.physAvailB),v:m.physUsedPct});
+  cards.push({k:"commit",st:hs.commit,name:"提交内存",val:pct(m.commitPct),sub:fmtB(m.commitTotalB)+" / "+fmtB(m.commitLimitB),v:m.commitPct});
+  (SNAP.disks||[]).forEach(d=>cards.push({k:"disk:"+d.id,st:hs["disk:"+d.id],name:"磁盘 "+(d.l||d.id),val:pct(d.busy),
+    sub:"读 "+fmtB(d.rb)+"/s · 写 "+fmtB(d.wb)+"/s · "+(d.rms+d.wms).toFixed(1)+"ms",v:d.busy}));
+  (SNAP.gpus||[]).forEach(g=>cards.push({k:"gpu:"+g.name,st:hs["gpu:"+g.name],name:"GPU "+g.name,val:pct(g.utilCapPct),
+    sub:g.dedTotalB?("显存 "+fmtB(g.dedUsedB)+" / "+fmtB(g.dedTotalB)):"共享 "+fmtB(g.shUsedB),v:g.utilCapPct}));
+  box.innerHTML=cards.map((c,i)=>`<div class="card ${stCls[c.st]||"ok"}">
+    <div class="name">${esc(c.name)}</div>
+    <div class="val" style="color:${c.st=="sat"?"var(--crit)":c.st=="warn"?"var(--warn)":"var(--text)"}">${esc(c.val)}</div>
+    <div class="sub">${esc(c.sub)}</div><canvas data-k="${esc(c.k)}" data-i="${i}"></canvas></div>`).join("");
+  box.querySelectorAll("canvas").forEach(cv=>{
+    drawSpark(cv,sparkKey(cv.dataset.k),sparkColor(+cv.dataset.i));
+  });
+}
+
+const METRICS=[["cpu","CPU"],["memp","内存"],["commit","提交"],["disk:*","磁盘忙"],["gpu:*","GPU"],["net","网络 MB/s"]];
+function renderChips(){
+  $("#metricChips").innerHTML=METRICS.map(m=>`<span class="chip ${METRIC===m[0]?"on":""}" data-m="${m[0]}">${m[1]}</span>`).join("");
+  $("#metricChips").querySelectorAll(".chip").forEach(ch=>ch.onclick=()=>{METRIC=ch.dataset.m;renderChips();drawChart()});
+  $("#rangeChips").innerHTML=[["300","5分钟"],["1800","30分钟"],["7200","2小时"]].map(r=>
+    `<span class="chip ${RANGE==+r[0]?"on":""}" data-r="${r[0]}">${r[1]}</span>`).join("");
+  $("#rangeChips").querySelectorAll(".chip").forEach(ch=>ch.onclick=()=>{RANGE=+ch.dataset.r;loadAll()});
+}
+
+function chartSeries(){
+  const out=[];
+  if(METRIC==="cpu")out.push({label:"CPU %",color:PAL[0],data:HIST.map(t=>[t.t,t.cpu]),max:100});
+  else if(METRIC==="memp")out.push({label:"内存 %",color:PAL[1],data:HIST.map(t=>[t.t,t.memp]),max:100});
+  else if(METRIC==="commit")out.push({label:"提交 %",color:PAL[2],data:HIST.map(t=>[t.t,t.commit]),max:100});
+  else if(METRIC==="net")out.push({label:"网络 MB/s",color:PAL[0],data:HIST.map(t=>[t.t,(t.nr+t.ns)/1048576]),max:0});
+  else if(METRIC==="disk:*"){
+    const ids=new Map();
+    HIST.forEach(t=>(t.disks||[]).forEach(d=>ids.set(d.id,d.l)));
+    let i=0;ids.forEach((l,id)=>out.push({label:"磁盘 "+(l||id),color:PAL[i++%PAL.length],
+      data:HIST.map(t=>{const d=(t.disks||[]).find(x=>x.id===id);return d?[t.t,d.busy]:null}).filter(Boolean),max:100}));
+  }else if(METRIC==="gpu:*"){
+    const names=new Set();
+    HIST.forEach(t=>(t.gpus||[]).forEach(g=>names.add(g.k)));
+    let i=0;names.forEach(n=>out.push({label:"GPU "+n,color:PAL[i++%PAL.length],
+      data:HIST.map(t=>{const g=(t.gpus||[]).find(x=>x.k===n);return g?[t.t,g.u]:null}).filter(Boolean),max:100}));
+  }
+  return out;
+}
+function drawChart(){
+  const cv=$("#chart"),dpr=devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;
+  cv.width=W*dpr;cv.height=H*dpr;
+  const c=cv.getContext("2d");c.scale(dpr,dpr);c.clearRect(0,0,W,H);
+  const ss=chartSeries(),L=44,R=10,T=8,B=22;
+  let max=0;ss.forEach(s=>s.data.forEach(p=>max=Math.max(max,p[1])));
+  max=ss.some(s=>s.max===100)?100:Math.max(10,max*1.15);
+  c.strokeStyle="#21262d";c.fillStyle="#8b949e";c.font="10px system-ui";
+  for(let i=0;i<=4;i++){const y=T+(H-T-B)*i/4;c.beginPath();c.moveTo(L,y);c.lineTo(W-R,y);c.stroke();
+    c.fillText(max*(1-i/4)>=10?Math.round(max*(1-i/4)):(max*(1-i/4)).toFixed(1),4,y+3)}
+  if(!HIST.length){c.fillText("暂无数据（等待采样…）",L+10,H/2);return}
+  const t0=HIST[0].t,t1=Math.max(HIST[HIST.length-1].t,t0+1);
+  for(let i=0;i<=4;i++){const d=new Date(t0+(t1-t0)*i/4),x=L+(W-L-R)*i/4;
+    c.fillText(("0"+d.getHours()).slice(-2)+":"+("0"+d.getMinutes()).slice(-2),x-12,H-8)}
+  ss.forEach(s=>{if(!s.data.length)return;
+    c.beginPath();
+    s.data.forEach((p,i)=>{const x=L+(p[0]-t0)/(t1-t0)*(W-L-R),y=T+(H-T-B)*(1-p[1]/max);
+      i?c.lineTo(x,y):c.moveTo(x,y)});
+    c.strokeStyle=s.color;c.lineWidth=1.6;c.stroke()});
+  $("#legend").innerHTML=ss.map(s=>`<span style="color:${s.color}">${esc(s.label)}</span>`).join("")||"<span>暂无数据</span>";
+}
+
+function renderAgents(){
+  const tb=$("#agents tbody"),as=(SNAP&&SNAP.agents)||[];
+  if(!as.length){tb.innerHTML=`<tr><td colspan="7" class="empty">暂无数据</td></tr>`;return}
+  tb.innerHTML=as.slice(0,20).map(a=>`<tr><td title="${esc(a.n)}">${esc(a.n)}</td>
+    <td class="num"><span class="bar"><i style="width:${Math.min(100,a.cpu)}%;background:${statusColor(a.cpu,65,85)}"></i></span>${a.cpu.toFixed(1)}</td>
+    <td class="num">${fmtB(a.priv)}</td>
+    <td class="num">${fmtB(a.rb+a.wb)}/s</td>
+    <td class="num">${a.gpu.toFixed(1)}</td>
+    <td class="num">${fmtB(a.vram)}</td>
+    <td class="num">${a.p}</td></tr>`).join("");
+}
+
+function renderProcs(){
+  const tb=$("#procs tbody"),ps=(SNAP&&SNAP.procs)||[];
+  const keyOf=p=>SORT.k==="io"?p.rb+p.wb:p[SORT.k];
+  const sorted=[...ps].sort((a,b)=>{
+    const va=keyOf(a),vb=keyOf(b);
+    if(typeof va==="string"||typeof vb==="string")return SORT.desc?String(vb).localeCompare(String(va)):String(va).localeCompare(String(vb));
+    return SORT.desc?vb-va:va-vb});
+  const top=sorted.slice(0,120);
+  if(!top.length){tb.innerHTML=`<tr><td colspan="8" class="empty">暂无数据</td></tr>`;return}
+  tb.innerHTML=top.map(p=>`<tr>
+    <td class="mono">${p.pid}</td>
+    <td title="${esc(p.path||p.n)}">${esc(p.n)}</td>
+    <td>${esc(p.a||"")}</td>
+    <td class="num">${p.cpu.toFixed(1)}</td>
+    <td class="num">${fmtB(p.priv)}</td>
+    <td class="num">${fmtB(p.rb)}/s / ${fmtB(p.wb)}/s</td>
+    <td class="num">${p.gpu?p.gpu.toFixed(1):""}</td>
+    <td class="num">${p.vram?fmtB(p.vram):""}</td></tr>`).join("");
+}
+document.querySelectorAll("#procs th").forEach(th=>th.onclick=()=>{
+  const k=th.dataset.k;if(!k)return;
+  if(SORT.k===k)SORT.desc=!SORT.desc;else{SORT.k=k;SORT.desc=true}
+  renderProcs();
+});
+
+function renderIncidents(incs){
+  const box=$("#incidents");
+  if(!incs||!incs.length){box.innerHTML='<div class="empty">暂无事件——资源状态未发生过迁移</div>';return}
+  box.innerHTML=incs.slice().reverse().map(i=>{
+    const d=new Date(i.t);
+    return `<div class="inc"><time>${d.toLocaleString("zh-CN",{hour12:false})}</time>
+      <b>${esc(i.dim)}</b> ${stCN[i.from]||i.from} → <b class="${stCls[i.to]||""}">${stCN[i.to]||i.to}</b>
+      ${i.detail?`<span style="color:var(--dim)">· ${esc(i.detail)}</span>`:""}</div>`}).join("");
+}
+
+function renderHeader(){
+  const st=SNAP&&SNAP.health?SNAP.health.overall:"ok";
+  const b=$("#overall");
+  b.textContent=stCN[st]||st;b.className="badge "+(stCls[st]||"ok");
+  const sys=SNAP&&SNAP.sys;
+  if(sys)$("#hostline").textContent=`${sys.host} · ${sys.cores} 核 · 开机 ${fmtUp(sys.uptimeSec)} · 采样 ${SNAP.intervalMs>0?SNAP.intervalMs:2000}ms`;
+  const errs=[].concat((SNAP&&SNAP.capErrors)||[],(SNAP&&SNAP.errors)||[]);
+  $("#footer").innerHTML=`数据目录 <span class="mono">${esc(sys?sys.dataDir:"")}</span> · ${sys&&sys.record?"历史记录中（totals/procs 按天落盘，retention 14 天）":"未开启记录"} · API：<span class="mono">/api/snapshot /api/history /api/procs /api/incidents</span>`
+    +(errs.length?`<br>采集降级：${errs.map(esc).join("；")}`:"");
+}
+function fmtUp(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+"天":"")+(h?h+"小时":"")+m+"分"}
+
+async function loadSnapshot(){
+  try{
+    SNAP=await(await fetch("/api/snapshot")).json();
+    renderHeader();renderCards();renderAgents();renderProcs();
+  }catch(e){$("#hostline").textContent="快照获取失败："+e}
+}
+async function loadHistory(){
+  try{
+    const r=await(await fetch("/api/history?sec="+RANGE)).json();
+    HIST=r.ticks||[];drawChart();renderCards();
+  }catch(e){$("#legend").innerHTML="<span>历史获取失败</span>"}
+}
+async function loadIncidents(){
+  try{const r=await(await fetch("/api/incidents?n=80")).json();renderIncidents(r.incidents)}
+  catch(e){}
+}
+async function loadAll(){await Promise.all([loadSnapshot(),loadHistory()])}
+
+renderChips();
+loadAll();loadIncidents();
+setInterval(loadSnapshot,2000);
+setInterval(loadHistory,4000);
+setInterval(loadIncidents,15000);
+window.addEventListener("resize",()=>{drawChart();renderCards()});
+</script>
+</body>
+</html>

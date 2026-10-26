@@ -1,0 +1,5 @@
+bin/
+data/
+*.exe
+*.test
+dist/
