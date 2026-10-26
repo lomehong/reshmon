@@ -16,6 +16,9 @@ jobs:
         run: |
           $out = gofmt -l .
           if ($out) { $out; exit 1 }
-      - run: go vet ./...
+      # unsafeptr 关闭原因：syswin/etw.go 的 C-ABI 回调必须把 uintptr 转
+      # unsafe.Pointer（Go 中唯一合法但无法静态证明的场景），布局已由
+      # 编译期断言与 TestFFISizes 钉死。
+      - run: go vet -unsafeptr=false ./...
       - run: go build ./...
       - run: go test ./... -count=1 -race

@@ -4,6 +4,8 @@
 
 - 覆盖 CPU（总体+每核+每进程）、内存（物理+提交）、磁盘 IO（吞吐/忙碌/延迟/队列，按物理盘）、GPU（利用率/显存，按进程归因，NVIDIA/AMD/Intel 全厂商）、网络（展示用）
 - **Agent 归因**：按进程树聚合——"Agent 及其全部子进程（编译器/测试/node…）"算成一笔账；**嵌套 Agent 各记各的**（ZCode 里跑 Claude：Claude 及其子树归 Claude，ZCode 自身与其余子树归 ZCode）；内置 ZCode/Claude/Codex/Cursor/Qoder/Ollama 等识别规则，可自行扩展。归因带 PID 复用防护（PID+进程创建时间双因子），换壳进程不会记到前任头上
+- **短命进程 IO 归因（ETW）**：管理员运行时订阅内核 DiskIO+Process 事件（IRP 配对），存活不足一个采样间隔的进程（编译/链接/测试的一次性 IO）也进 Agent 账本；非管理员自动降级，不影响其余功能
+- **MCP 接口**：`reshmon mcp` 以 stdio 暴露资源快照/Agent 账本/趋势/事件 5 个工具——AI Agent 发起任务前自查机器负载，自行决策并发与时机
 - **历史落盘**：每 2s 总量+Agent 账本、每 30s 进程切片，按天轮转 gzip，默认保留 14 天
 - 零第三方运行时依赖（仅 golang.org/x/sys），GPU 走 Windows 性能计数器（厂商无关），NVIDIA 温度经 nvml.dll 机会性增强
 
@@ -14,9 +16,9 @@ cd D:\Develop\Projects\reshmon
 go build -o bin/reshmon.exe ./cmd/reshmon
 ```
 
-要求：Windows 10 1709+（GPU 计数器）、Go 1.27+。普通权限即可运行；以管理员运行可看到更多受保护进程的内存/IO 明细。
+要求：Windows 10 1709+（GPU 计数器）、Go 1.27+。普通权限即可运行；以管理员运行可看到更多受保护进程的内存/IO 明细，并启用 ETW 短命进程 IO 归因。
 
-## 四个命令
+## 五个命令
 
 ### 1. once —— 单次体检（脚本/顺手看一眼）
 
@@ -57,7 +59,30 @@ D:\Develop\Projects\reshmon\bin\reshmon.exe live
 
 Ctrl+C 退出；默认同样记录历史。参数：`-data 目录`、`-no-record`、`-interval 1s`。
 
-### 4. report —— 事后回溯（"昨晚三点是谁把磁盘打满了"）
+### 4. mcp —— MCP 服务器（让 Agent 自查资源后决策并发）
+
+```bash
+D:\Develop\Projects\reshmon\bin\reshmon.exe mcp
+```
+
+以 stdio 运行 [Model Context Protocol](https://modelcontextprotocol.io) 服务器，暴露 5 个工具：`resource_snapshot`（健康快照）、`agent_usage`（Agent 账本）、`top_processes`（进程 Top）、`resource_trend`（趋势摘要）、`health_events`（状态迁移）。内嵌只读采样（不落盘、不抢数据目录写锁），可与常驻 `serve` 共存，多个 Agent 各自启动互不干扰。
+
+把下面配置加进 ZCode / Claude 等 MCP 客户端即可：
+
+```json
+{
+  "mcpServers": {
+    "reshmon": {
+      "command": "D:\\Develop\\Projects\\reshmon\\bin\\reshmon.exe",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+之后 Agent 就能在发起大构建/并发任务前自己调 `resource_snapshot` 看余量，用 `agent_usage` 看自己和同伴各占多少，再决定开多大并发。
+
+### 5. report —— 事后回溯（"昨晚三点是谁把磁盘打满了"）
 
 ```bash
 reshmon.exe report                      # 今天 0 点到现在
@@ -77,11 +102,12 @@ reshmon.exe report -day 2026-10-25      # 指定某天
 {
   "intervalMs": 2000,
   "procEverySec": 30,
-  "retentionDays": 14
+  "retentionDays": 14,
+  "etwIO": true
 }
 ```
 
-窗口/频率以**时长**为源：判定窗口恒约 30s、进程切片恒约 30s、环形缓冲恒约 2 小时——改 `intervalMs`（或 `-interval`）不会让这些承诺漂移。配置文件解析失败时工具以默认值继续跑，但会在 stderr 与面板上报 ⚠ 告警（不会静默失效）。
+`etwIO`：短命进程 IO 归因（ETW 内核事件），默认开；需要管理员运行才实际生效，非管理员自动降级并在面板/TUI/MCP 的 errors 里明示。窗口/频率以**时长**为源：判定窗口恒约 30s、进程切片恒约 30s、环形缓冲恒约 2 小时——改 `intervalMs`（或 `-interval`）不会让这些承诺漂移。配置文件解析失败时工具以默认值继续跑，但会在 stderr 与面板上报 ⚠ 告警（不会静默失效）。
 
 **`agents.json`**——Agent 识别规则（追加在内置规则之后；`match` 默认匹配进程名小写子串，`path:` 前缀匹配完整路径，`name:` 前缀精确匹配进程名）：
 
@@ -117,8 +143,8 @@ reshmon.exe report -day 2026-10-25      # 指定某天
 - **进程 CPU%** 为占全机容量的百分比（全进程之和≈总体使用率）；单进程上限 100。分母取全机逻辑处理器数（跨处理器组），不受本工具自身亲和性影响。
 - **GPU 利用率**是各引擎（3D/Compute/Copy/VideoDecode…）之和，单进程可超 100（多引擎并行），显示时截断；核显（如 AMD 860M）"显存"为 BIOS 划分的专用份额（常 512MB），大头上共享系统内存——看"共享占用"。进程显存归因为专用+共享之和。
 - **Agent 内存**按私有提交（Private Bytes）求和，避免工作集把共享 DLL 重复计入。
-- **短命进程误差**：存活不足一个采样间隔（2s）的进程，其 CPU/IO 增量会丢失（累计值随进程消失）；磁盘/GPU 总量不受影响。
-- **磁盘忙碌** = 100 − %Idle Time；受保护进程的明细需管理员权限。
+- **短命进程 IO 归因（ETW）**：管理员运行时，内核 DiskIO 事件按 IRP 配对归到发起进程——存活不足一个采样间隔的进程（编译/链接的一次性 IO）也进 Agent 账本；其整段生命的字节记在退出后的那一拍上（该拍速率偏高，总量正确）。短命进程的 **CPU** 增量仍会丢失（累计值随进程消失），磁盘/GPU 总量不受影响。
+- **磁盘忙碌** = 100 − %Idle Time；受保护进程的明细需管理员权限（IO 明细在管理员下由 ETW 补齐）。
 - **网络总量**剔除虚拟适配器（Hyper-V vNIC/WSL/TAP 等）——同一流量会同时过 vNIC 与 pNIC 两个实例，全量求和会翻倍；明细表仍展示全部网卡。
 - 每核负载只在 `live` 面板显示为 ▮ 色条。
 
@@ -128,6 +154,8 @@ reshmon.exe report -day 2026-10-25      # 指定某天
 - **NVMe 的"队列"**计数器在新存储栈上常年显示 0（系统侧如此），判据只用忙碌%与延迟。
 - **GPU 引擎首拍/末拍**：新出现的引擎实例首拍无基线记 0，进程退出瞬间的 GPU 贡献丢失一拍（与任务管理器同类的固有口径）。
 - **NVIDIA 温度**按设备名与 DXGI 对齐，名称不可得时按稳定顺序配对；温度读取失败显示为空（-1 语义），不伪装成 0℃。
+- **ETW 归因的边缘**：父链在会话启动前已全部死亡的短命进程只能按镜像名落桶（拿不到祖先 Agent）；分页 IO 按 IRP 发起上下文归账（多为触发进程）。ETW 需管理员，非管理员自动降级并在 errors 中明示。
+- **amd64 only**：PDH/ETW 的 FFI 结构体按 x64 布局手写并有编译期断言（`internal/syswin`）。
 
 ## 典型用法：定位"磁盘被谁打满"
 
@@ -148,21 +176,22 @@ powershell -NoProfile -Command "$s=(New-Object -ComObject WScript.Shell).CreateS
 
 ## 技术路线
 
-- 全部数据源走 Win32 原生 API：PDH 性能计数器（**RAW 路线**，相邻帧差分自算速率——`PdhGetFormattedCounterArray` 在部分系统上行为异常，`PdhGetRawCounterArray` 稳定）、Toolhelp32 + OpenProcess（进程 CPU/内存/IO）、GlobalMemoryStatusEx/GetPerformanceInfo（内存）、DXGI（GPU 适配器命名/LUID 映射）、NVML（NVIDIA 温度，可选）
+- 全部数据源走 Win32 原生 API：PDH 性能计数器（**RAW 路线**，相邻帧差分自算速率——`PdhGetFormattedCounterArray` 在部分系统上行为异常，`PdhGetRawCounterArray` 稳定）、Toolhelp32 + OpenProcess（进程 CPU/内存/IO）、GlobalMemoryStatusEx/GetPerformanceInfo（内存）、DXGI（GPU 适配器命名/LUID 映射）、NVML（NVIDIA 温度，可选）、**ETW 内核事件**（短命进程 IO：DiskIO Init/完成按 IRP 配对 + Process_V2 身份追踪，`internal/syswin/etw.go`，FFI 布局有编译期断言）
+- MCP 服务器手写 JSON-RPC 2.0 over stdio（`internal/mcp`），零第三方依赖
 - 计数器一律用英文名添加（PdhAddEnglishCounter），中文系统不受影响
-- 本工具自身开销：2s 一拍 ≈ 每拍一次 PDH 采集 + 一次进程枚举，常态 CPU <1%、内存 ~20MB
+- 本工具自身开销：2s 一拍 ≈ 每拍一次 PDH 采集 + 一次进程枚举，常态 CPU <1%、内存 ~20MB；ETW 会话（管理员下）仅在磁盘事件回调里做 map 计数，开销可忽略
 
 ## 开发
 
 ```bash
-go build ./... && go vet ./... && gofmt -l .   # 必须无输出
+go build ./... && go vet -unsafeptr=false ./... && gofmt -l .   # 必须无输出
 go test ./... -race
 ```
 
-仅支持 Windows（业务包带 `//go:build windows`）；`internal/report` 与 `internal/store` 跨平台纯逻辑。CI（GitHub Actions windows-latest）跑 fmt/vet/build/test -race，见 `.github/workflows/ci.yml`。
+仅支持 Windows amd64（业务包带 `//go:build windows`）；`internal/report` 与 `internal/store` 跨平台纯逻辑。vet 关闭 `unsafeptr` 仅因 ETW 回调的 C-ABI 边界（uintptr→unsafe.Pointer 无法静态证明，布局由断言钉死）。CI（GitHub Actions windows-latest）跑 fmt/vet/build/test -race，见 `.github/workflows/ci.yml`。
 
 ## 路线图（未做，按需立项）
 
 - NVIDIA 之外的温度/功耗（需要厂商 SDK，暂无系统级通用源）
-- ETW 捕获短命进程的 IO 归因
-- MCP 接口（让 Agent 自己看资源再决策并发）
+- 短命进程的 **CPU** 增量归因（需要 CSwitch/采样剖析类事件，量级与开销需先评估）
+- MCP 增加 `concurrency_advice` 类决策辅助工具（目前刻意只给事实，决策留给 Agent）
