@@ -478,7 +478,12 @@ func StartEphemeralTracker() (*EphemeralTracker, error) {
 	r, _, _ := procStartTrace.Call(uintptr(unsafe.Pointer(&session)),
 		uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(props)))
 	if uint32(r) == errAlreadyExists {
-		// 残留会话（上次异常退出）：先停再试一次
+		// 会话已存在（另一 reshmon 实例持有，或上次异常退出的残留）：
+		// 实时会话支持多消费者——直接附加消费，绝不拆掉重启（那会掐断
+		// 先来实例的句柄）。附加失败才回退到停旧建新。
+		if t, err := attachEphemeralTracker(name); err == nil {
+			return t, nil
+		}
 		procControlTrace.Call(0, uintptr(unsafe.Pointer(name)),
 			uintptr(unsafe.Pointer(props)), eventTraceControlStop)
 		r, _, _ = procStartTrace.Call(uintptr(unsafe.Pointer(&session)),
@@ -494,11 +499,31 @@ func StartEphemeralTracker() (*EphemeralTracker, error) {
 	t := &EphemeralTracker{
 		state:        newEtwState(),
 		sessionProps: propsBuf,
-		sessionOK:    true,
+		sessionOK:    true, // 本实例 StartTrace 成功：Stop 时负责回收会话
 		stopped:      make(chan struct{}),
 	}
-	t.callback = windows.NewCallback(t.onEvent)
+	if err := t.openAndConsume(name); err != nil {
+		t.stopSession()
+		return nil, err
+	}
+	return t, nil
+}
 
+// attachEphemeralTracker 附加到已存在的 "reshmon" 会话（只消费不控制，
+// Stop 时只关自己的消费句柄，不动会话本身）。
+func attachEphemeralTracker(name *uint16) (*EphemeralTracker, error) {
+	t := &EphemeralTracker{state: newEtwState(), stopped: make(chan struct{})}
+	if err := t.openAndConsume(name); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// openAndConsume 打开实时消费并启动处理 goroutine（成功后 traceHandle 非零）。
+func (t *EphemeralTracker) openAndConsume(name *uint16) error {
+	if t.callback == 0 {
+		t.callback = windows.NewCallback(t.onEvent)
+	}
 	lfBuf := etwLogfileW{
 		LoggerName:          uintptr(unsafe.Pointer(name)),
 		ProcessTraceMode:    processTraceModeRealTime | processTraceModeEventRec,
@@ -508,16 +533,15 @@ func StartEphemeralTracker() (*EphemeralTracker, error) {
 	h, _, _ := procOpenTrace.Call(uintptr(unsafe.Pointer(&lfBuf)))
 	t.traceHandle = uint64(h)
 	if t.traceHandle == 0xFFFFFFFFFFFFFFFF {
-		t.stopSession()
-		return nil, fmt.Errorf("OpenTrace 失败（实时消费同样需要管理员权限）")
+		return fmt.Errorf("OpenTrace 失败（实时消费同样需要管理员权限）")
 	}
-
+	handle := t.traceHandle
 	go func() {
 		defer close(t.stopped)
-		arr := [1]uint64{t.traceHandle}
+		arr := [1]uint64{handle}
 		procProcessTrace.Call(uintptr(unsafe.Pointer(&arr[0])), 1, 0, 0)
 	}()
-	return t, nil
+	return nil
 }
 
 // onEvent EVENT_RECORD_CALLBACK：按 Provider GUID 分发，解析后交给状态机。
