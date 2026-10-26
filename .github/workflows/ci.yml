@@ -1,0 +1,21 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          $out = gofmt -l .
+          if ($out) { $out; exit 1 }
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./... -count=1 -race
