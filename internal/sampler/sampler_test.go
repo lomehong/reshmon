@@ -49,4 +49,8 @@ func TestRateHelpers(t *testing.T) {
 	if v := timerPct(b, a); v != 0 { // 时间倒流防护
 		t.Fatalf("倒流应返回 0: %v", v)
 	}
+	// 反相计时器：原始值累计空闲 → 活跃 = 100 - 空闲
+	if v := invTimerPct(a, b); v < 99.98 || v > 99.991 { // 空闲 0.01% → 活跃 99.99%
+		t.Fatalf("invTimerPct 口径变化: %v", v)
+	}
 }

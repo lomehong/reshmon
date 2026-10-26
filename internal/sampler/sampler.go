@@ -211,6 +211,12 @@ func timerPct(a, b rawVal) float64 {
 	return float64(b.first-a.first) / float64(b.ts-a.ts) * 100
 }
 
+// invTimerPct: PERF_100NSEC_TIMER_INV 差分 → 百分比
+// （first 为累计空闲时间，活跃% = 100 - 空闲%）。CPU % Processor Time 用此口径。
+func invTimerPct(a, b rawVal) float64 {
+	return 100 - timerPct(a, b)
+}
+
 // bulkRate: PERF_COUNTER_BULK_COUNT 差分 → 每秒速率。
 func bulkRate(a, b rawVal) float64 {
 	if b.ts <= a.ts {
@@ -256,7 +262,10 @@ func (s *Sampler) readCPU(snap *model.Snapshot, cur map[string]rawSet) {
 		if !ok {
 			continue
 		}
-		v := clamp(timerPct(p, now), 0, 100)
+		// % Processor Time 是反相 100ns 计时器（PERF_100NSEC_TIMER_INV）：
+		// 原始值累计的是空闲时间，忙% = 100 - 差分空闲%。
+		// 对照：\PhysicalDisk\% Idle Time 为正相（原始值=空闲），GPU Engine 同为正相。
+		v := clamp(invTimerPct(p, now), 0, 100)
 		if name == "_Total" {
 			snap.CPU.BusyPct = v
 			continue
