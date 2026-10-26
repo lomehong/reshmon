@@ -7,6 +7,7 @@ package webui
 import (
 	_ "embed"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/lomehong/reshmon/internal/app"
+	"github.com/lomehong/reshmon/internal/mcp"
 	"github.com/lomehong/reshmon/internal/model"
 	"github.com/lomehong/reshmon/internal/store"
 	"github.com/lomehong/reshmon/internal/syswin"
@@ -161,6 +163,28 @@ func handler(a *app.App, allowedHosts map[string]bool) http.Handler {
 			incs = incs[len(incs)-n:]
 		}
 		writeJSON(w, map[string]any{"incidents": incs})
+	})
+
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		// MCP Streamable HTTP：serve 已在跑时 Agent 走这里（单实例采样 +
+		// ETW 会话，多 Agent 共享同一份口径）；stdio 版 reshmon mcp 是
+		// serve 未运行时的独立兜底。工具均无状态，不分配会话 ID：
+		// GET/DELETE 返回 405（规范允许），纯通知批次答 202。
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		resp, ok := mcp.HandleBody(a, app.Version, body)
+		if !ok {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		writeJSON(w, resp)
 	})
 
 	if allowedHosts != nil {

@@ -11,6 +11,7 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -51,29 +52,20 @@ type rpcResponse struct {
 }
 
 // Serve 在 in/out 上运行 MCP 协议直到 EOF（阻塞）。errW 用于诊断日志。
+// 工具均为无状态只读，无需跨请求会话状态。
 func Serve(src Source, version string, in io.Reader, out, errW io.Writer) error {
 	enc := json.NewEncoder(out)
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	initialized := false
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
 		}
-		var req rpcRequest
-		if err := json.Unmarshal([]byte(line), &req); err != nil {
-			_ = enc.Encode(rpcResponse{JSONRPC: "2.0", ID: json.RawMessage("null"),
-				Error: &jsonRPCError{Code: -32700, Message: "解析错误: " + err.Error()}})
-			continue
+		resp, hasResp := handleLine(src, version, []byte(line))
+		if !hasResp {
+			continue // notification：不回包
 		}
-		if len(req.ID) == 0 { // notification：不回包
-			if req.Method == "notifications/initialized" {
-				initialized = true
-			}
-			continue
-		}
-		resp := dispatch(src, version, &req, &initialized)
 		if err := enc.Encode(resp); err != nil {
 			return err
 		}
@@ -81,7 +73,49 @@ func Serve(src Source, version string, in io.Reader, out, errW io.Writer) error 
 	return sc.Err()
 }
 
-func dispatch(src Source, version string, req *rpcRequest, initialized *bool) rpcResponse {
+// HandleBody 处理一次 HTTP POST 的 MCP 请求体（Streamable HTTP 传输）：
+// 支持单对象与 JSON-RPC 批量数组；全为 notification 时 ok=false（HTTP
+// 层应答 202 无 body）。
+func HandleBody(src Source, version string, body []byte) (resp any, ok bool) {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var batch []json.RawMessage
+		if err := json.Unmarshal(trimmed, &batch); err != nil {
+			return parseError(err), true
+		}
+		out := make([]rpcResponse, 0, len(batch))
+		for _, item := range batch {
+			if r, has := handleLine(src, version, item); has {
+				out = append(out, r)
+			}
+		}
+		if len(out) == 0 {
+			return nil, false // 纯通知批次：无响应（HTTP 层答 202）
+		}
+		return out, true
+	}
+	r, has := handleLine(src, version, trimmed)
+	return r, has
+}
+
+func handleLine(src Source, version string, line []byte) (rpcResponse, bool) {
+	var req rpcRequest
+	if err := json.Unmarshal(line, &req); err != nil {
+		return rpcResponse{JSONRPC: "2.0", ID: json.RawMessage("null"),
+			Error: &jsonRPCError{Code: -32700, Message: "解析错误: " + err.Error()}}, true
+	}
+	if len(req.ID) == 0 { // notification：不回包
+		return rpcResponse{}, false
+	}
+	return dispatch(src, version, &req), true
+}
+
+func parseError(err error) rpcResponse {
+	return rpcResponse{JSONRPC: "2.0", ID: json.RawMessage("null"),
+		Error: &jsonRPCError{Code: -32700, Message: "解析错误: " + err.Error()}}
+}
+
+func dispatch(src Source, version string, req *rpcRequest) rpcResponse {
 	switch req.Method {
 	case "initialize":
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
@@ -94,10 +128,6 @@ func dispatch(src Source, version string, req *rpcRequest, initialized *bool) rp
 	case "tools/list":
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": toolDefs()}}
 	case "tools/call":
-		if !*initialized {
-			// 宽容处理：不少客户端不严格发 initialized 通知
-			*initialized = true
-		}
 		return callTool(src, req.ID, req.Params)
 	default:
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID,

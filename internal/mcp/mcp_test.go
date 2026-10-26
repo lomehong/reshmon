@@ -159,3 +159,38 @@ func TestBadJSONAndUnknownMethod(t *testing.T) {
 		t.Fatalf("未知方法应 -32601: %v", resps[1])
 	}
 }
+
+// Streamable HTTP 路径：单对象 / 批量数组 / 纯通知（ok=false → HTTP 层 202）。
+func TestHandleBody(t *testing.T) {
+	src := newFake()
+	// 单对象
+	resp, ok := HandleBody(src, "t", []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+	if !ok {
+		t.Fatal("请求必须有响应")
+	}
+	if resp.(rpcResponse).ID == nil {
+		t.Fatal("单对象响应缺 ID")
+	}
+	// 批量：请求+通知混合 → 只回请求的响应
+	resp, ok = HandleBody(src, "t", []byte(`[
+		{"jsonrpc":"2.0","method":"notifications/initialized"},
+		{"jsonrpc":"2.0","id":5,"method":"tools/list"}
+	]`))
+	if !ok {
+		t.Fatal("批量含请求必须有响应")
+	}
+	batch := resp.([]rpcResponse)
+	if len(batch) != 1 || string(batch[0].ID) != "5" {
+		t.Fatalf("批量应只回 1 条请求响应: %+v", batch)
+	}
+	// 纯通知批次 → ok=false
+	_, ok = HandleBody(src, "t", []byte(`[{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9}}]`))
+	if ok {
+		t.Fatal("纯通知批次应 ok=false（HTTP 202）")
+	}
+	// 坏 JSON
+	resp, ok = HandleBody(src, "t", []byte(`{broken`))
+	if !ok || resp.(rpcResponse).Error == nil {
+		t.Fatal("坏 JSON 应返回解析错误")
+	}
+}

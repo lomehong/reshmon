@@ -4,9 +4,11 @@ package webui
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,6 +78,75 @@ func TestHostGuard(t *testing.T) {
 	h2.ServeHTTP(w3, evil)
 	if w3.Code == http.StatusForbidden {
 		t.Fatal("通配绑定不应拦截")
+	}
+}
+
+// MCP Streamable HTTP 端点：POST /mcp 走 MCP 协议，GET 拒 405，
+// 纯通知批次答 202；与 Host 白名单共存。
+func TestMCPHTTPEndpoint(t *testing.T) {
+	a := newTestApp(t)
+	srv := httptest.NewServer(Handler(a))
+	defer srv.Close()
+	client := srv.Client()
+
+	// initialize + tools/call（Streamable HTTP 单对象 POST）
+	initResp, err := client.Post(srv.URL+"/mcp", "application/json",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer initResp.Body.Close()
+	var init map[string]any
+	if err := json.NewDecoder(initResp.Body).Decode(&init); err != nil {
+		t.Fatal(err)
+	}
+	if init["result"].(map[string]any)["serverInfo"].(map[string]any)["name"] != "reshmon" {
+		t.Fatalf("initialize 响应错误: %v", init)
+	}
+
+	// 等首拍就绪（500ms 间隔的嵌入式采样）
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if s, _ := a.Current(); s != nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	callResp, err := client.Post(srv.URL+"/mcp", "application/json",
+		strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"top_processes","arguments":{"dimension":"cpu","limit":3}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer callResp.Body.Close()
+	var call map[string]any
+	if err := json.NewDecoder(callResp.Body).Decode(&call); err != nil {
+		t.Fatal(err)
+	}
+	content := call["result"].(map[string]any)["content"].([]any)[0].(map[string]any)
+	if !strings.Contains(content["text"].(string), "pid") {
+		t.Fatalf("tools/call 应返回进程数据: %v", content)
+	}
+
+	// GET → 405（无服务器推送流，规范允许）
+	getResp, err := client.Get(srv.URL + "/mcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	getResp.Body.Close()
+	if getResp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /mcp 应 405: %d", getResp.StatusCode)
+	}
+
+	// 纯通知 → 202 无 body
+	notiResp, err := client.Post(srv.URL+"/mcp", "application/json",
+		strings.NewReader(`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	notiResp.Body.Close()
+	if notiResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("纯通知应 202: %d", notiResp.StatusCode)
 	}
 }
 
