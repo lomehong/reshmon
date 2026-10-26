@@ -12,6 +12,7 @@ import (
 	"github.com/lomehong/reshmon/internal/model"
 	"github.com/lomehong/reshmon/internal/sampler"
 	"github.com/lomehong/reshmon/internal/store"
+	"github.com/lomehong/reshmon/internal/syswin"
 )
 
 const (
@@ -43,6 +44,7 @@ type App struct {
 	incLog *store.IncidentLog
 	judge  *health.Judge
 	lock   *dirLock
+	etw    *syswin.EphemeralTracker
 
 	mu         sync.RWMutex
 	cur        *model.Snapshot
@@ -86,6 +88,15 @@ func Start(cfg Config) (*App, error) {
 	}
 	if lockErr != nil {
 		a.addErr("历史记录已停用：" + lockErr.Error())
+	}
+	if cfg.ETW {
+		// 短命进程 IO 归因（ETW）：需要管理员，失败只降级不阻断。
+		if tr, terr := syswin.StartEphemeralTracker(); terr == nil {
+			a.etw = tr
+			s.AttachEphemeral(tr)
+		} else {
+			a.addErr("短命进程 IO 追踪（ETW）不可用：" + terr.Error())
+		}
 	}
 	a.loadIncidentBaseline()
 	if cfg.Record {
@@ -222,6 +233,9 @@ func (a *App) Current() (*model.Snapshot, health.Report) {
 
 func (a *App) Ring() *store.Ring { return a.ring }
 
+// Interval 采样间隔（MCP 等消费者换算窗口 tick 数用）。
+func (a *App) Interval() time.Duration { return a.Cfg.Interval }
+
 // Incidents 最近 incKeep 条状态迁移（内存副本——含启动时回放的历史，
 // -no-record 模式下也有当前会话的事件）。
 func (a *App) Incidents() []store.Incident {
@@ -269,6 +283,9 @@ func (a *App) Close() {
 	}
 	a.incLog.Close()
 	a.lock.release()
+	if a.etw != nil {
+		a.etw.Stop()
+	}
 }
 
 // TotalsFrom 把快照压缩为每 tick 总量记录。
