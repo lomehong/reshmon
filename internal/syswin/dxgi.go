@@ -36,6 +36,7 @@ type DXGIAdapter struct {
 	Vendor         string
 	DedicatedVRAMB uint64
 	SharedSysMemB  uint64
+	IsWARP         bool // Microsoft Basic Render Driver：CPU 软件渲染回退，非物理 GPU
 }
 
 var dxgiVendors = map[uint32]string{
@@ -97,12 +98,16 @@ func EnumDXGIAdapters() ([]DXGIAdapter, error) {
 			continue
 		}
 		descStr := windows.UTF16ToString(desc.Description[:])
-		if descStr == "Microsoft Basic Render Driver" {
-			continue // WARP 软件回退适配器，非真实 GPU
-		}
+		// WARP（软件回退适配器）不再静默跳过：带上标记返回，由采样层
+		// 全链路剔除其引擎/显存口径——否则它偶发的引擎活动会凭空多出
+		// 一张"GPU 0x0000…"幻影卡片。
+		isWARP := descStr == "Microsoft Basic Render Driver"
 		vendor := "其他"
 		if v, ok := dxgiVendors[desc.VendorID]; ok {
 			vendor = v
+		}
+		if isWARP {
+			vendor = "Microsoft"
 		}
 		out = append(out, DXGIAdapter{
 			Description:    descStr,
@@ -111,6 +116,7 @@ func EnumDXGIAdapters() ([]DXGIAdapter, error) {
 			Vendor:         vendor,
 			DedicatedVRAMB: desc.DedicatedVideoMemory,
 			SharedSysMemB:  desc.SharedSystemMemory,
+			IsWARP:         isWARP,
 		})
 	}
 	return out, nil

@@ -109,3 +109,22 @@ func TestLettersOf(t *testing.T) {
 		t.Fatalf("lettersOf 无盘符应为空: %q", l)
 	}
 }
+
+// WARP（Microsoft Basic Render Driver）必须被识别剔除——否则其偶发的
+// 引擎活动会凭空多出一张 "GPU 0x0000…" 幻影卡片（实测复现过的 bug）。
+func TestWarpLUIDSet(t *testing.T) {
+	ads := []syswin.DXGIAdapter{
+		{LUIDKey: "0x00000000_0x0000c437", Description: "AMD Radeon(TM) 860M Graphics", Vendor: "AMD"},
+		{LUIDKey: "0x00000000_0x000000e1", Description: "Microsoft Basic Render Driver", Vendor: "Microsoft", IsWARP: true},
+	}
+	w := warpLUIDSet(ads)
+	if !w["0x00000000_0x000000e1"] {
+		t.Fatal("WARP 适配器未被标记")
+	}
+	if w["0x00000000_0x0000c437"] {
+		t.Fatal("物理 GPU 不得被标记为 WARP")
+	}
+	if len(warpLUIDSet(nil)) != 0 {
+		t.Fatal("空适配器表应返回空集")
+	}
+}

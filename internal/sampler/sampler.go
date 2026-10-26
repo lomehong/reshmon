@@ -369,6 +369,17 @@ func timerOrRaw(key string, p, now rawVal, timebase float64) float64 {
 	}
 }
 
+// warpLUIDSet 提取 WARP（软件渲染回退）适配器的 LUID 集合。
+func warpLUIDSet(adapters []syswin.DXGIAdapter) map[string]bool {
+	warp := map[string]bool{}
+	for _, a := range adapters {
+		if a.IsWARP {
+			warp[a.LUIDKey] = true
+		}
+	}
+	return warp
+}
+
 func lettersOf(id string) string {
 	f := strings.Fields(id)
 	if len(f) <= 1 {
@@ -382,6 +393,13 @@ func (s *Sampler) readGPUs(snap *model.Snapshot, cur map[string]rawSet) (gpuByPi
 	vramByPid = map[uint32]uint64{}
 	engLuid := map[string]float64{}
 
+	adapters := s.adapters()
+	// WARP（Microsoft Basic Render Driver）是 CPU 软件渲染回退，非物理 GPU：
+	// 其引擎活动偶发非零（进程短暂走软件光栅化），会凭空多出一张
+	// "GPU 0x0000…" 幻影卡片。全链路剔除（引擎/进程显存/适配器内存），
+	// 与任务管理器口径一致——WARP 的活是 CPU 干的。
+	warpLUIDs := warpLUIDSet(adapters)
+
 	set := s.raw("gpueng", s.cGPUEng, cur)
 	if set != nil {
 		prev := s.prevRaw["gpueng"]
@@ -391,7 +409,7 @@ func (s *Sampler) readGPUs(snap *model.Snapshot, cur map[string]rawSet) (gpuByPi
 				continue
 			}
 			pid, luid, ok2 := ParseGPUEngineInstance(name)
-			if !ok2 {
+			if !ok2 || warpLUIDs[luid] {
 				continue
 			}
 			v := timerPct(p, now) // 单引擎 0-100，多引擎并行可累加超 100
@@ -412,8 +430,8 @@ func (s *Sampler) readGPUs(snap *model.Snapshot, cur map[string]rawSet) (gpuByPi
 			if now.first < 0 {
 				continue
 			}
-			pid, _, ok := ParseGPUEngineInstance(name)
-			if !ok {
+			pid, luid, ok := ParseGPUEngineInstance(name)
+			if !ok || warpLUIDs[luid] {
 				continue
 			}
 			// local=专用显存，nonlocal=共享显存（核显/iGPU 上跑的进程大头在这），
@@ -427,7 +445,7 @@ func (s *Sampler) readGPUs(snap *model.Snapshot, cur map[string]rawSet) (gpuByPi
 		aset := s.raw("gpuad:"+k, c, cur)
 		for name, now := range aset {
 			luid, ok := ParseLUIDInstance(name)
-			if !ok || now.first < 0 {
+			if !ok || now.first < 0 || warpLUIDs[luid] {
 				continue
 			}
 			m := adapt[luid]
@@ -443,14 +461,16 @@ func (s *Sampler) readGPUs(snap *model.Snapshot, cur map[string]rawSet) (gpuByPi
 	for l := range engLuid {
 		luids[l] = true
 	}
-	adapters := s.adapters()
 	nvmlDevs := s.nvml()
 	named := map[string]bool{}
 	for _, a := range adapters {
+		if warpLUIDs[a.LUIDKey] {
+			continue
+		}
 		luids[a.LUIDKey] = true
 		named[a.LUIDKey] = true
 	}
-	// 未被 DXGI 命名且无引擎活动的 LUID（WARP/间接适配器的内存实例）视为噪音。
+	// 未被 DXGI 命名且无引擎活动的 LUID（间接适配器的内存实例）视为噪音。
 	for l := range luids {
 		if !named[l] && engLuid[l] <= 0 {
 			delete(luids, l)
