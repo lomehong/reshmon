@@ -21,6 +21,7 @@ import (
 
 	"github.com/lomehong/reshmon/internal/app"
 	"github.com/lomehong/reshmon/internal/health"
+	"github.com/lomehong/reshmon/internal/mcp"
 	"github.com/lomehong/reshmon/internal/model"
 	"github.com/lomehong/reshmon/internal/report"
 	"github.com/lomehong/reshmon/internal/sampler"
@@ -52,6 +53,8 @@ func main() {
 		err = cmdLive(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "mcp":
+		err = cmdMCP(os.Args[2:])
 	case "report":
 		err = cmdReport(os.Args[2:])
 	case "help", "-h", "--help":
@@ -74,6 +77,7 @@ func usage() {
   reshmon once    [-json] [-obs 800ms] [-data 目录]     单次采样打印，退出码 0/1/2=健康/亚健康/饱和，3=执行错误
   reshmon live    [-data 目录] [-no-record] [-interval 1s]   终端实时面板
   reshmon serve   [-addr 127.0.0.1:8964] [-data 目录] [-no-record] [-interval 1s]   Web 面板（默认同时记录历史）
+  reshmon mcp     [-data 目录]   MCP 服务器（stdio）——让 Agent 自查资源后决策并发
   reshmon report  [-day 2026-10-26 | -last 24h]         回溯分析已记录的历史
   reshmon version
 
@@ -302,6 +306,33 @@ func cmdServe(args []string) error {
 
 	fmt.Printf("reshmon %s 面板: http://%s/   (Ctrl+C 停止)\n数据目录: %s   历史记录: %v\n", app.Version, *addr, cfg.DataDir, cfg.Record)
 	return webui.Serve(a, *addr)
+}
+
+// cmdMCP MCP 服务器（stdio）：供 AI Agent 接入——发起任务前自查资源
+// （快照/Agent 账本/趋势/事件），自行决定并发与时机。
+// stdout 是协议通道，一切诊断输出走 stderr。内嵌只读采样（不落盘、
+// 不抢数据目录写锁），多个 Agent 各自启动互不干扰。
+func cmdMCP(args []string) error {
+	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
+	dataDir := fs.String("data", "", "数据目录")
+	interval := fs.Duration("interval", 0, "采样间隔（默认读 config，初始 2s）")
+	_ = fs.Parse(args)
+
+	cfg, warns := app.LoadConfig(*dataDir)
+	cfg.Record = false // 只读：不落盘、不占数据目录锁，与常驻 serve 共存
+	if *interval > 0 {
+		cfg.Interval = *interval
+		cfg.DeriveForInterval()
+	}
+	for _, w := range warns {
+		fmt.Fprintln(os.Stderr, "⚠", w)
+	}
+	a, err := app.Start(cfg)
+	if err != nil {
+		return err
+	}
+	defer a.Close()
+	return mcp.Serve(a, app.Version, os.Stdin, os.Stdout, os.Stderr)
 }
 
 // cmdReport 离线回溯分析。
