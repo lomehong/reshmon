@@ -12,7 +12,8 @@ import (
 )
 
 // Pattern 一条识别规则。Match 为小写子串，默认匹配进程 exe 名；
-// 加 "path:" 前缀则匹配进程完整路径。
+// "path:" 前缀匹配进程完整路径；"name:" 前缀精确匹配 exe 名
+// （避免如 droid/android 这类子串误伤）。
 type Pattern struct {
 	Match string `json:"match"`
 	Label string `json:"label"`
@@ -35,7 +36,7 @@ func DefaultPatterns() []Pattern {
 		p("copilot", "Copilot"),
 		p("qwen", "Qwen"),
 		p("kimi", "Kimi"),
-		p("droid", "Droid"),
+		p("name:droid.exe", "Droid"),
 		p("qoder", "Qoder"),
 		p("ollama", "Ollama"),
 		p("lmstudio", "LM Studio"),
@@ -86,11 +87,18 @@ var sysRoots = map[string]string{
 // Engine 进程归因引擎（有状态：sticky 表跨 tick 保持孤儿进程归属）。
 type Engine struct {
 	patterns []Pattern
-	sticky   map[uint32]string
+	sticky   map[uint32]stickyEnt
+}
+
+// stickyEnt 孤儿进程的历史归属；create 为进程创建时间——PID 被复用
+// （新进程 create 不同）时历史立即作废，不把新进程记到前任的 Agent 头上。
+type stickyEnt struct {
+	label  string
+	create uint64
 }
 
 func New(patterns []Pattern) *Engine {
-	return &Engine{patterns: patterns, sticky: map[uint32]string{}}
+	return &Engine{patterns: patterns, sticky: map[uint32]stickyEnt{}}
 }
 
 func (e *Engine) match(name, path string) (string, bool) {
@@ -100,24 +108,31 @@ func (e *Engine) match(name, path string) (string, bool) {
 		if m == "" {
 			continue
 		}
-		if strings.HasPrefix(m, "path:") {
+		switch {
+		case strings.HasPrefix(m, "path:"):
 			sub := strings.TrimPrefix(m, "path:")
 			if path != "" && strings.Contains(strings.ToLower(path), sub) {
 				return pt.Label, true
 			}
-			continue
-		}
-		if strings.Contains(n, m) {
-			return pt.Label, true
+		case strings.HasPrefix(m, "name:"):
+			if n == strings.TrimPrefix(m, "name:") {
+				return pt.Label, true
+			}
+		default:
+			if strings.Contains(n, m) {
+				return pt.Label, true
+			}
 		}
 	}
 	return "", false
 }
 
 // Attribute 为每个进程标注 Agent 归属（写回 procs[i].Agent）。
-// 规则：从进程沿父链上溯到根，链上任意节点命中识别规则则归入该 Agent
-// （最靠近根的命中优先，使"Agent 主进程→编译器→测试"整棵树算一笔账）；
-// 父链已死或无命中时沿用 sticky 历史；否则按根进程名归入系统桶。
+// 规则：从进程沿父链上溯，取离自身最近的识别规则命中（嵌套 Agent——如
+// ZCode 里跑 Claude——各记各的账：Claude 及其子树归 Claude，ZCode 自身
+// 与其余子树归 ZCode）；父链已死时沿用 sticky 历史（校验创建时间防 PID
+// 复用）；否则按根进程名归入系统桶——系统桶优先于 sticky，防止陈旧的
+// sticky 抢占系统服务进程。
 func (e *Engine) Attribute(procs []model.ProcStat) {
 	byPID := make(map[uint32]int, len(procs))
 	for i := range procs {
@@ -126,23 +141,24 @@ func (e *Engine) Attribute(procs []model.ProcStat) {
 	for i := range procs {
 		procs[i].Agent = e.labelFor(procs, i, byPID)
 	}
-	alive := make(map[uint32]struct{}, len(procs))
+	alive := make(map[uint32]uint64, len(procs))
 	for i := range procs {
 		pid := procs[i].PID
-		alive[pid] = struct{}{}
+		alive[pid] = procs[i].Start
 		if procs[i].Agent != "" {
-			e.sticky[pid] = procs[i].Agent
+			e.sticky[pid] = stickyEnt{label: procs[i].Agent, create: procs[i].Start}
 		}
 	}
 	for pid := range e.sticky {
-		if _, ok := alive[pid]; !ok {
+		if create, ok := alive[pid]; !ok || create != e.sticky[pid].create {
 			delete(e.sticky, pid)
 		}
 	}
 }
 
 func (e *Engine) labelFor(procs []model.ProcStat, i int, byPID map[uint32]int) string {
-	// 从自身沿父链上溯，chain[0]=自身，chain[len-1]=根。
+	// 从自身沿父链上溯，chain[0]=自身，chain[len-1]=可达的最老祖先。
+	// 父候选需创建时间不晚于子进程（剔除 PPID 被复用产生的假父子）。
 	var chain []int
 	cur := procs[i].PID
 	seen := map[uint32]bool{}
@@ -153,29 +169,40 @@ func (e *Engine) labelFor(procs []model.ProcStat, i int, byPID map[uint32]int) s
 		}
 		seen[cur] = true
 		chain = append(chain, idx)
-		cur = procs[idx].PPID
-		if cur == 0 {
+		next := procs[idx].PPID
+		if next == 0 {
 			break
 		}
+		if pIdx, ok2 := byPID[next]; ok2 &&
+			procs[pIdx].Start != 0 && procs[idx].Start != 0 && procs[pIdx].Start > procs[idx].Start {
+			break
+		}
+		cur = next
 	}
-	// 从根向下找第一个识别规则命中。
-	for j := len(chain) - 1; j >= 0; j-- {
+	// 1. 从自身向根找第一个识别规则命中：最近的 Agent 祖先优先。
+	for j := 0; j < len(chain); j++ {
 		q := &procs[chain[j]]
 		if label, ok := e.match(q.Name, q.Path); ok {
 			return label
 		}
 	}
-	if s, ok := e.sticky[procs[i].PID]; ok && s != "" {
-		return s
+	if len(chain) == 0 {
+		return strings.ToLower(procs[i].Name)
 	}
-	if len(chain) > 0 {
-		root := strings.ToLower(procs[chain[len(chain)-1]].Name)
-		if r, ok := sysRoots[root]; ok {
-			return r
+	root := strings.ToLower(procs[chain[len(chain)-1]].Name)
+	// 2. 系统根归系统桶（优先于 sticky，防陈旧历史抢占系统进程）。
+	if r, ok := sysRoots[root]; ok {
+		return r
+	}
+	// 3. 孤儿（父链断裂，chain 只剩自身）沿用 sticky 历史；
+	//    创建时间不一致 = PID 被复用，历史作废。
+	if len(chain) == 1 {
+		if s, ok := e.sticky[procs[i].PID]; ok && s.label != "" && s.create == procs[i].Start {
+			return s.label
 		}
-		return root
 	}
-	return strings.ToLower(procs[i].Name)
+	// 4. 根名桶。
+	return root
 }
 
 // Aggregate 按归属标签聚合资源。进程级 GPU 单值上限按 100 截断后累加，

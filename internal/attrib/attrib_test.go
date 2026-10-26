@@ -107,3 +107,101 @@ func TestLoadUserPatterns(t *testing.T) {
 		t.Fatalf("读取失败: %v %v", p, err)
 	}
 }
+
+// 嵌套 Agent 各记各的：ZCode 里跑 Claude——最近的 Agent 祖先优先，
+// Claude 及其子树归 Claude，ZCode 自身与其余子树归 ZCode。
+func TestNestedAgentsNearestFirst(t *testing.T) {
+	e := New([]Pattern{
+		{Match: "zcode", Label: "ZCode"},
+		{Match: "claude", Label: "Claude"},
+	})
+	procs := []model.ProcStat{
+		{PID: 1, PPID: 0, Name: "zcode.exe"},
+		{PID: 2, PPID: 1, Name: "claude.exe"},
+		{PID: 3, PPID: 2, Name: "node.exe"}, // Claude 的子进程 → Claude
+		{PID: 4, PPID: 1, Name: "go.exe"},   // ZCode 的其余子进程 → ZCode
+	}
+	e.Attribute(procs)
+	if procs[0].Agent != "ZCode" {
+		t.Fatalf("zcode 自身归因错误: %q", procs[0].Agent)
+	}
+	if procs[1].Agent != "Claude" || procs[2].Agent != "Claude" {
+		t.Fatalf("嵌套内层 Agent 归因错误: %q %q", procs[1].Agent, procs[2].Agent)
+	}
+	if procs[3].Agent != "ZCode" {
+		t.Fatalf("外层其余子树归因错误: %q", procs[3].Agent)
+	}
+}
+
+// PID 复用防护：同一 PID 换了进程（创建时间不同）后，陈旧 sticky 立即作废，
+// 不把新进程记到前任的 Agent 头上。
+func TestStickyPIDReuseInvalidated(t *testing.T) {
+	e := New([]Pattern{{Match: "myagent", Label: "MyAgent"}})
+	first := []model.ProcStat{
+		{PID: 1, PPID: 0, Name: "myagent.exe", Start: 100},
+		{PID: 42, PPID: 1, Name: "compiler.exe", Start: 200},
+	}
+	e.Attribute(first)
+	if first[1].Agent != "MyAgent" {
+		t.Fatalf("预置失败: %q", first[1].Agent)
+	}
+	// PID 42 被新进程复用（Start 不同）且是孤儿：sticky 不再生效
+	second := []model.ProcStat{{PID: 42, PPID: 999, Name: "svchost.exe", Start: 5000}}
+	e.Attribute(second)
+	if second[0].Agent == "MyAgent" {
+		t.Fatalf("PID 复用后不应沿用 sticky: %q", second[0].Agent)
+	}
+	if second[0].Agent != "svchost.exe" {
+		t.Fatalf("应回落根名桶: %q", second[0].Agent)
+	}
+}
+
+// 系统桶优先于 sticky：链上可见的系统根不被陈旧 sticky 抢占。
+func TestSysRootBeatsSticky(t *testing.T) {
+	e := New([]Pattern{{Match: "myagent", Label: "MyAgent"}})
+	first := []model.ProcStat{
+		{PID: 1, PPID: 0, Name: "myagent.exe"},
+		{PID: 42, PPID: 1, Name: "compiler.exe"},
+	}
+	e.Attribute(first)
+	// PID 42 被复用为服务进程且父链指向活的 services.exe
+	second := []model.ProcStat{
+		{PID: 7, PPID: 0, Name: "services.exe"},
+		{PID: 42, PPID: 7, Name: "svchost.exe"},
+	}
+	e.Attribute(second)
+	if second[1].Agent != "系统服务" {
+		t.Fatalf("系统桶应优先于 sticky: %q", second[1].Agent)
+	}
+}
+
+// name: 前缀精确匹配——"droid" 子串会误伤一切含 android 的进程名。
+func TestNamePattern(t *testing.T) {
+	e := New([]Pattern{{Match: "name:droid.exe", Label: "Droid"}})
+	procs := []model.ProcStat{
+		{PID: 1, PPID: 0, Name: "android.exe"},
+		{PID: 2, PPID: 0, Name: "droid.exe"},
+	}
+	e.Attribute(procs)
+	if procs[0].Agent == "Droid" {
+		t.Fatal("android.exe 不应命中 droid 规则")
+	}
+	if procs[1].Agent != "Droid" {
+		t.Fatalf("droid.exe 应命中: %q", procs[1].Agent)
+	}
+}
+
+// 假父剔除：PPID 指向一个比"子进程"创建得更晚的进程（PID 复用产物），
+// 链应在此截断，不把子进程归到假父的树下。
+func TestFakeParentPruned(t *testing.T) {
+	e := New([]Pattern{{Match: "myagent", Label: "MyAgent"}})
+	procs := []model.ProcStat{
+		{PID: 1, PPID: 0, Name: "explorer.exe", Start: 1000},
+		{PID: 2, PPID: 1, Name: "worker.exe", Start: 900}, // "父"比子晚创建 → 假父
+		{PID: 3, PPID: 0, Name: "myagent.exe", Start: 100},
+	}
+	e.Attribute(procs)
+	if procs[1].Agent == "MyAgent" {
+		t.Fatal("假父链不应把进程归给无关 Agent")
+	}
+}

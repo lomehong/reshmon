@@ -4,6 +4,7 @@ package model
 
 import (
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -97,9 +98,10 @@ type ProcStat struct {
 	Name     string  `json:"n"`
 	Path     string  `json:"path,omitempty"`
 	Agent    string  `json:"a,omitempty"`
-	CpuPct   float64 `json:"cpu"`  // 占全机 CPU 容量的百分比
-	MemWSB   uint64  `json:"ws"`   // 工作集
-	MemPrivB uint64  `json:"priv"` // 私有提交内存
+	Start    uint64  `json:"st,omitempty"` // 进程创建时间（FILETIME 100ns）——PID 复用防护
+	CpuPct   float64 `json:"cpu"`          // 占全机 CPU 容量的百分比
+	MemWSB   uint64  `json:"ws"`           // 工作集
+	MemPrivB uint64  `json:"priv"`         // 私有提交内存
 	ReadBps  float64 `json:"rb"`
 	WriteBps float64 `json:"wb"`
 	GpuPct   float64 `json:"gpu,omitempty"`
@@ -141,9 +143,19 @@ type DiskTotal struct {
 }
 
 type GPUTotal struct {
-	Key     string  `json:"k"` // 显示名
+	Key     string  `json:"k"` // 身份键：归一化 LUID（稳定，不随 DXGI 命名失败而漂移）
+	Name    string  `json:"n,omitempty"`
 	Util    float64 `json:"u"`
 	VramPct float64 `json:"vp"`
+}
+
+// DiskKey 磁盘身份键：PDH 实例名的物理盘号（"0 C:" → "0"）。
+// 盘符增减只改显示名，不产生新的健康维度/事件键。
+func DiskKey(id string) string {
+	if f := strings.Fields(id); len(f) > 0 {
+		return f[0]
+	}
+	return id
 }
 
 // FmtBytes 人类可读的字节数。
