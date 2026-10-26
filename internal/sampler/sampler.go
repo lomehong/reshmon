@@ -87,6 +87,7 @@ type Sampler struct {
 	prevAt    time.Time
 	prevProcs map[uint32]procAcc
 
+	eph    EphemeralSource // 可选：ETW 短命进程 IO 补充
 	engine *attrib.Engine
 }
 
@@ -623,6 +624,16 @@ func (s *Sampler) readMem(snap *model.Snapshot) {
 	}
 }
 
+// EphemeralSource 短命进程 IO 的补充数据源（ETW 实现；测试可注入伪源）。
+// Consume 结算某 PID 本窗字节；TakeDead 取出已退出进程的一次性归因记录。
+type EphemeralSource interface {
+	Consume(pid uint32) (read, write uint64)
+	TakeDead(alive map[uint32]bool) []syswin.EphemeralProc
+}
+
+// AttachEphemeral 挂接短命进程追踪（ETW）。须在首次 Tick 前调用。
+func (s *Sampler) AttachEphemeral(e EphemeralSource) { s.eph = e }
+
 func (s *Sampler) readProcs(snap *model.Snapshot, now time.Time, gpuByPid map[uint32]float64, vramByPid map[uint32]uint64) {
 	dt := 0.0
 	if !s.prevAt.IsZero() {
@@ -635,7 +646,9 @@ func (s *Sampler) readProcs(snap *model.Snapshot, now time.Time, gpuByPid map[ui
 	}
 	procs := make([]model.ProcStat, 0, len(infos))
 	next := make(map[uint32]procAcc, len(infos))
+	alive := map[uint32]bool{}
 	for _, in := range infos {
+		alive[in.PID] = true
 		p := model.ProcStat{
 			PID:      in.PID,
 			PPID:     in.PPID,
@@ -651,7 +664,9 @@ func (s *Sampler) readProcs(snap *model.Snapshot, now time.Time, gpuByPid map[ui
 		p.VramB = vramByPid[in.PID]
 		// 身份键 = PID + 创建时间：PID 被复用时基线作废（首拍速率置 0），
 		// 不把前任进程的累计值差分到新进程头上。
-		if prev, ok := s.prevProcs[in.PID]; ok && dt > 0.05 && prev.create == in.Create {
+		prev, hadPrev := s.prevProcs[in.PID]
+		diffed := false
+		if hadPrev && dt > 0.05 && prev.create == in.Create {
 			if in.CPU100ns >= prev.cpu {
 				p.CpuPct = clamp(float64(in.CPU100ns-prev.cpu)/(dt*1e7)*100/float64(s.numCPU), 0, 100)
 			}
@@ -661,14 +676,44 @@ func (s *Sampler) readProcs(snap *model.Snapshot, now time.Time, gpuByPid map[ui
 			if in.WriteB >= prev.writeB {
 				p.WriteBps = float64(in.WriteB-prev.writeB) / dt
 			}
+			// GetProcessIoCounters 计数可用（本拍或上拍非全零）→ 差分已覆盖。
+			diffed = in.ReadB > 0 || in.WriteB > 0 || prev.readB > 0 || prev.writeB > 0
+		}
+		// ETW 补充：首拍/受保护进程（差分不可用）把本窗 ETW 字节并入速率；
+		// 已覆盖的进程也要 Consume 掉，防止字节滞留到死后被重复结算。
+		if s.eph != nil && dt > 0.05 && !diffed {
+			if r, w := s.eph.Consume(in.PID); r > 0 || w > 0 {
+				p.ReadBps += float64(r) / dt
+				p.WriteBps += float64(w) / dt
+			}
 		}
 		next[in.PID] = procAcc{create: in.Create, cpu: in.CPU100ns, readB: in.ReadB, writeB: in.WriteB}
 		procs = append(procs, p)
+	}
+	// 已退出进程的未结算 IO 转为一次性归因记录（其整段生命的字节都记在
+	// 本拍窗口上，速率口径偏高但总量正确）。
+	var ephs []model.ProcStat
+	if s.eph != nil && dt > 0.05 {
+		for _, d := range s.eph.TakeDead(alive) {
+			ephs = append(ephs, model.ProcStat{
+				PID: d.PID, PPID: d.PPID, Name: d.Name, Start: d.Create,
+				ReadBps: float64(d.ReadB) / dt, WriteBps: float64(d.WriteB) / dt,
+			})
+		}
 	}
 	s.prevProcs = next
 	s.prevAt = now
 	snap.Interval = time.Duration(dt * float64(time.Second))
 
+	// 归因与聚合把短命进程一并纳入（树中可用其存活父链/ETW 记录的 PPID）；
+	// 进程表面板只展示当前存活进程。
+	if len(ephs) > 0 {
+		combined := append(append([]model.ProcStat{}, procs...), ephs...)
+		s.engine.Attribute(combined)
+		snap.Procs = procs
+		snap.Agents = attrib.Aggregate(combined)
+		return
+	}
 	s.engine.Attribute(procs)
 	snap.Procs = procs
 	snap.Agents = attrib.Aggregate(procs)
