@@ -23,14 +23,15 @@ const (
 
 // Run 分析 [from,to] 并返回人读报告文本。
 func Run(dataDir string, from, to time.Time) (string, error) {
-	totals, err := store.LoadTotals(dataDir, from, to)
+	totals, warns, err := store.LoadTotals(dataDir, from, to)
 	if err != nil {
 		return "", err
 	}
 	if len(totals) == 0 {
 		return fmt.Sprintf("%s ~ %s 范围内没有历史记录。serve/live 默认开启记录（--no-record 可关）。", from.Format("01-02 15:04"), to.Format("01-02 15:04")), nil
 	}
-	procs, _ := store.LoadProcs(dataDir, from, to)
+	procs, pwarns, _ := store.LoadProcs(dataDir, from, to)
+	warns = append(warns, pwarns...)
 	incs, _ := store.LoadIncidents(dataDir, from, to)
 
 	var b strings.Builder
@@ -38,6 +39,10 @@ func Run(dataDir string, from, to time.Time) (string, error) {
 	fmt.Fprintf(&b, "reshmon 回溯报告  %s ~ %s  样本 %d 条  跨度 %s\n",
 		time.UnixMilli(totals[0].T).Format("01-02 15:04"), time.UnixMilli(totals[len(totals)-1].T).Format("01-02 15:04"),
 		len(totals), span.Truncate(time.Second))
+	// 数据缺口必须显式说明：缺失的进程/事件证据段不能被误读为"当时无嫌疑"。
+	for _, w := range warns {
+		fmt.Fprintf(&b, "⚠ %s\n", w)
+	}
 
 	// 总体健康分布
 	dist := map[string]int{}
@@ -68,34 +73,45 @@ func Run(dataDir string, from, to time.Time) (string, error) {
 	section(&b, totals, procs, W, "内存", dimMem, func(t model.Totals) float64 { return t.MemUsedPct })
 	section(&b, totals, procs, W, "提交内存", dimMem, func(t model.Totals) float64 { return t.CommitPct })
 
-	// 磁盘（按盘实例）
-	ids := map[string]string{}
+	// 磁盘（按物理盘身份键聚合：盘符增减不拆裂序列）
+	dids := map[string]string{}
 	for _, t := range totals {
 		for _, d := range t.Disks {
+			k := model.DiskKey(d.ID)
 			if d.L != "" {
-				ids[d.ID] = d.L
+				dids[k] = d.L
+			} else if _, ok := dids[k]; !ok {
+				dids[k] = k
 			}
 		}
 	}
-	for _, id := range sortedKeys(ids) {
-		section(&b, totals, procs, W, "磁盘 "+ids[id], dimIO, func(t model.Totals) float64 {
+	for _, id := range sortedKeys(dids) {
+		section(&b, totals, procs, W, "磁盘 "+dids[id], dimIO, func(t model.Totals) float64 {
 			for _, d := range t.Disks {
-				if d.ID == id {
+				if model.DiskKey(d.ID) == id {
 					return d.Busy
 				}
 			}
 			return 0
 		})
 	}
-	// GPU（按适配器）
+	// GPU（按 LUID 身份键聚合，显示名取自任一带名字的记录）
+	gnames := map[string]string{}
 	gkeys := map[string]bool{}
 	for _, t := range totals {
 		for _, g := range t.GPUs {
 			gkeys[g.Key] = true
+			if g.Name != "" {
+				gnames[g.Key] = g.Name
+			}
 		}
 	}
 	for _, k := range sortedKeysB(gkeys) {
-		section(&b, totals, procs, W, "GPU "+k, dimGPU, func(t model.Totals) float64 {
+		label := gnames[k]
+		if label == "" {
+			label = k
+		}
+		section(&b, totals, procs, W, "GPU "+label, dimGPU, func(t model.Totals) float64 {
 			for _, g := range t.GPUs {
 				if g.Key == k {
 					return g.Util
