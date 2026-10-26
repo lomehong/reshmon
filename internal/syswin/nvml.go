@@ -22,7 +22,7 @@ var (
 // 这里只补充 PDH 拿不到的温度）。
 type NVMLDevice struct {
 	Name  string
-	TempC int
+	TempC int // 不可得为 -1（与 model.GPUStat 的约定一致）
 }
 
 // NVMLDevices 读取 NVIDIA 附加信息。驱动未带 nvml.dll（或非 NVIDIA）时返回 nil。
@@ -51,6 +51,7 @@ func NVMLDevices() (out []NVMLDevice) {
 			continue
 		}
 		var dev NVMLDevice
+		dev.TempC = -1 // 先置「不可得」，读到真实温度再覆盖
 		name := make([]byte, 128)
 		if r, _, _ := procNvmlDevName.Call(h, uintptr(unsafe.Pointer(&name[0])), uintptr(len(name))); r == 0 {
 			dev.Name = cstr(name)

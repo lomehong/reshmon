@@ -4,6 +4,7 @@ package syswin
 
 import (
 	"os"
+	"runtime"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -82,6 +83,37 @@ func ReadMemStatOS() (MemStatOS, error) {
 func UptimeMs() uint64 {
 	r, _, _ := procGetTickCount64.Call()
 	return uint64(r)
+}
+
+var procGetActiveProcCount = modKernel32.NewProc("GetActiveProcessorCount")
+
+// ActiveCPUCount 全机逻辑处理器数（跨全部处理器组）。
+// runtime.NumCPU() 受进程默认组/亲和性约束，作 CPU% 分母会在受限时高估，
+// 这里用 GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) 对齐全机口径。
+func ActiveCPUCount() int {
+	const allGroups = 0xFFFF
+	r, _, _ := procGetActiveProcCount.Call(allGroups)
+	if n := int(r); n > 0 {
+		return n
+	}
+	return runtime.NumCPU()
+}
+
+// PidAlive 判断进程是否仍存活（锁文件里的 PID 是否属于活着的实例）。
+func PidAlive(pid uint32) bool {
+	if pid == 0 {
+		return false
+	}
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(h)
+	var code uint32
+	if err := windows.GetExitCodeProcess(h, &code); err != nil {
+		return false
+	}
+	return code == 259 // STILL_ACTIVE
 }
 
 // SetupConsole 让终端输出 UTF-8 并启用 ANSI 转义（VT）支持。

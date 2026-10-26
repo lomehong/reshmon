@@ -24,6 +24,7 @@ type ProcInfo struct {
 	PID, PPID   uint32
 	Name        string
 	Path        string
+	Create      uint64 // 进程创建时间（FILETIME 100ns）——PID 复用防护的复合键
 	CPU100ns    uint64 // kernel+user 累计（100ns 单位）
 	WorkingSetB uint64
 	PrivateB    uint64
@@ -85,6 +86,7 @@ func fillProcDetail(pi *ProcInfo) {
 
 	var create, exit, kernel, user windows.Filetime
 	if err := windows.GetProcessTimes(h, &create, &exit, &kernel, &user); err == nil {
+		pi.Create = filetime100(create)
 		pi.CPU100ns = filetime100(kernel) + filetime100(user)
 	}
 

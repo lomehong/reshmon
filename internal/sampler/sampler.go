@@ -7,7 +7,6 @@ package sampler
 
 import (
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,7 +34,8 @@ var diskPaths = map[string]string{
 }
 
 var gpuProcMemPaths = map[string]string{
-	"local": `\GPU Process Memory(*)\Local Usage`,
+	"local":    `\GPU Process Memory(*)\Local Usage`,
+	"nonlocal": `\GPU Process Memory(*)\Non Local Usage`,
 }
 
 var gpuAdaptMemPaths = map[string]string{
@@ -74,6 +74,9 @@ type Sampler struct {
 
 	prevRaw map[string]rawSet
 
+	// rms/wms 计数器的真实时间基准（PERF_AVERAGE_TIMER 换算用）。
+	diskBase map[string]float64
+
 	adapterCache []syswin.DXGIAdapter
 	adapterAt    time.Time
 	nvmlCache    []syswin.NVMLDevice
@@ -88,6 +91,7 @@ type Sampler struct {
 }
 
 type procAcc struct {
+	create uint64 // 进程创建时间——与 PID 一起构成身份键，防 PID 复用串账
 	cpu    uint64
 	readB  uint64
 	writeB uint64
@@ -109,7 +113,8 @@ func New(interval time.Duration, patterns []attrib.Pattern) (*Sampler, error) {
 		cNet:      map[string]*syswin.PDHCounter{},
 		capSeen:   map[string]bool{},
 		prevRaw:   map[string]rawSet{},
-		numCPU:    runtime.NumCPU(),
+		diskBase:  map[string]float64{},
+		numCPU:    syswin.ActiveCPUCount(),
 		prevProcs: map[uint32]procAcc{},
 		engine:    attrib.New(patterns),
 	}
@@ -136,6 +141,11 @@ func New(interval time.Duration, patterns []attrib.Pattern) (*Sampler, error) {
 	}
 	add(&s.cCPU, pathCPU)
 	addMap(s.cDisk, diskPaths)
+	for _, k := range []string{"rms", "wms"} {
+		if c := s.cDisk[k]; c != nil {
+			s.diskBase[k] = c.TimeBase()
+		}
+	}
 	add(&s.cGPUEng, pathGPUEngine)
 	addMap(s.cGPUMem, gpuProcMemPaths)
 	addMap(s.cGPUAd, gpuAdaptMemPaths)
@@ -186,12 +196,21 @@ func (s *Sampler) Tick() *model.Snapshot {
 }
 
 // raw 读取计数器当前帧，登记进 cur，返回当前帧。
+// 软错误（个别计数器暂无实例）不记降级：沿用上一帧基线登记进 cur，
+// 使下一拍仍能对更早一帧差分（速率按真实时间戳归一，窗口拉长不失真）。
 func (s *Sampler) raw(key string, c *syswin.PDHCounter, cur map[string]rawSet) rawSet {
 	if c == nil {
 		return nil
 	}
 	items, err := c.RawItems()
 	if err != nil {
+		if syswin.IsPDHSoft(err) {
+			if prev, ok := s.prevRaw[key]; ok {
+				cur[key] = prev
+				return prev
+			}
+			return nil
+		}
 		s.noteCap(err.Error())
 		return nil
 	}
@@ -226,12 +245,13 @@ func bulkRate(a, b rawVal) float64 {
 }
 
 // avgTimerMs: PERF_AVERAGE_TIMER 差分 → 每次操作平均毫秒
-// （first 为累计时间 100ns，second 为累计次数）。
-func avgTimerMs(a, b rawVal) float64 {
-	if b.second <= a.second {
+// （first 为按 timebase 计的累计时间，second 为累计次数）。
+// timebase 由 PdhGetCounterTimeBase 取真实值（QPC≠10MHz 平台不放大）。
+func avgTimerMs(a, b rawVal, timebase float64) float64 {
+	if b.second <= a.second || timebase <= 0 {
 		return 0
 	}
-	return float64(b.first-a.first) / float64(b.second-a.second) / 1e4
+	return float64(b.first-a.first) / timebase * 1000 / float64(b.second-a.second)
 }
 
 func clamp(v, lo, hi float64) float64 {
@@ -303,7 +323,7 @@ func (s *Sampler) readDisks(snap *model.Snapshot, cur map[string]rawSet) {
 				a = &diskAgg{}
 				ags[name] = a
 			}
-			f(a, timerOrRaw(key, p, now))
+			f(a, timerOrRaw(key, p, now, s.diskBase[key]))
 		}
 	}
 	// %Idle Time 是反相计时器：差分得到空闲%，忙 = 100 - 空闲。
@@ -333,14 +353,14 @@ func (s *Sampler) readDisks(snap *model.Snapshot, cur map[string]rawSet) {
 	sort.Slice(snap.Disks, func(i, j int) bool { return snap.Disks[i].ID < snap.Disks[j].ID })
 }
 
-// timerOrRaw 按计数器键选差分口径：q 为瞬时值，rms/wms 为均次毫秒，
-// idle 为反相计时器百分比，其余为每秒速率。
-func timerOrRaw(key string, p, now rawVal) float64 {
+// timerOrRaw 按计数器键选差分口径：q 为瞬时值，rms/wms 为均次毫秒
+// （用计数器真实 timebase），idle 为反相计时器百分比，其余为每秒速率。
+func timerOrRaw(key string, p, now rawVal, timebase float64) float64 {
 	switch key {
 	case "q":
 		return float64(now.first)
 	case "rms", "wms":
-		return avgTimerMs(p, now)
+		return avgTimerMs(p, now, timebase)
 	case "idle":
 		return timerPct(p, now)
 	default:
@@ -381,8 +401,12 @@ func (s *Sampler) readGPUs(snap *model.Snapshot, cur map[string]rawSet) (gpuByPi
 			engLuid[luid] += v
 		}
 	}
-	if c := s.cGPUMem["local"]; c != nil {
-		mset := s.raw("gpumem:local", c, cur)
+	for _, k := range []string{"local", "nonlocal"} {
+		c := s.cGPUMem[k]
+		if c == nil {
+			continue
+		}
+		mset := s.raw("gpumem:"+k, c, cur)
 		for name, now := range mset {
 			if now.first < 0 {
 				continue
@@ -391,6 +415,8 @@ func (s *Sampler) readGPUs(snap *model.Snapshot, cur map[string]rawSet) (gpuByPi
 			if !ok {
 				continue
 			}
+			// local=专用显存，nonlocal=共享显存（核显/iGPU 上跑的进程大头在这），
+			// 进程显存归因按两者之和计。
 			vramByPid[pid] += uint64(now.first)
 		}
 	}
@@ -429,20 +455,68 @@ func (s *Sampler) readGPUs(snap *model.Snapshot, cur map[string]rawSet) (gpuByPi
 			delete(luids, l)
 		}
 	}
-	nvidiaSeen := 0
+	// NVIDIA 温度按设备名对齐（DXGI Description ↔ nvmlDeviceGetName），
+	// 名称不可用或不匹配时按 LUID 升序兜底配对——保证确定性，
+	// 避免 map 迭代序随机导致多卡温度每拍互换。
+	luidSorted := make([]string, 0, len(luids))
 	for l := range luids {
-		name := "GPU " + l
-		vendor, vramTotal := "", uint64(0)
-		for _, a := range adapters {
-			if a.LUIDKey == l {
-				name, vendor, vramTotal = a.Description, a.Vendor, a.DedicatedVRAMB
+		luidSorted = append(luidSorted, l)
+	}
+	sort.Strings(luidSorted)
+	byLUID := map[string]syswin.DXGIAdapter{}
+	for _, a := range adapters {
+		byLUID[a.LUIDKey] = a
+	}
+	nvTemp := map[string]int{}
+	nvTaken := map[int]bool{}
+	for i, nd := range nvmlDevs {
+		if nd.TempC < 0 || nd.Name == "" {
+			continue
+		}
+		nm := strings.ToLower(nd.Name)
+		for _, l := range luidSorted {
+			if nvTemp[l] != 0 {
+				continue
+			}
+			a := byLUID[l]
+			if a.Vendor != "NVIDIA" {
+				continue
+			}
+			al := strings.ToLower(a.Description)
+			if al != "" && (strings.Contains(al, nm) || strings.Contains(nm, al)) {
+				nvTemp[l] = nd.TempC
+				nvTaken[i] = true
 				break
 			}
 		}
-		temp := -1
-		if vendor == "NVIDIA" && nvidiaSeen < len(nvmlDevs) {
-			temp = nvmlDevs[nvidiaSeen].TempC
-			nvidiaSeen++
+	}
+	// 兜底：未对上的 NVIDIA 设备按（排序后的）LUID 顺序配剩余温度。
+	restNV := []int{}
+	for i, nd := range nvmlDevs {
+		if !nvTaken[i] && nd.TempC >= 0 {
+			restNV = append(restNV, i)
+		}
+	}
+	ri := 0
+	for _, l := range luidSorted {
+		if ri >= len(restNV) {
+			break
+		}
+		if nvTemp[l] != 0 || byLUID[l].Vendor != "NVIDIA" {
+			continue
+		}
+		nvTemp[l] = nvmlDevs[restNV[ri]].TempC
+		ri++
+	}
+	for l := range luids {
+		name := "GPU " + l
+		vendor, vramTotal := "", uint64(0)
+		if a := byLUID[l]; a.LUIDKey == l {
+			name, vendor, vramTotal = a.Description, a.Vendor, a.DedicatedVRAMB
+		}
+		temp := nvTemp[l]
+		if temp == 0 {
+			temp = -1
 		}
 		m := adapt[l]
 		var ded, shared, commit uint64
@@ -567,6 +641,7 @@ func (s *Sampler) readProcs(snap *model.Snapshot, now time.Time, gpuByPid map[ui
 			PPID:     in.PPID,
 			Name:     in.Name,
 			Path:     in.Path,
+			Start:    in.Create,
 			MemWSB:   in.WorkingSetB,
 			MemPrivB: in.PrivateB,
 		}
@@ -574,7 +649,9 @@ func (s *Sampler) readProcs(snap *model.Snapshot, now time.Time, gpuByPid map[ui
 			p.GpuPct = clamp(g, 0, 100)
 		}
 		p.VramB = vramByPid[in.PID]
-		if prev, ok := s.prevProcs[in.PID]; ok && dt > 0.05 {
+		// 身份键 = PID + 创建时间：PID 被复用时基线作废（首拍速率置 0），
+		// 不把前任进程的累计值差分到新进程头上。
+		if prev, ok := s.prevProcs[in.PID]; ok && dt > 0.05 && prev.create == in.Create {
 			if in.CPU100ns >= prev.cpu {
 				p.CpuPct = clamp(float64(in.CPU100ns-prev.cpu)/(dt*1e7)*100/float64(s.numCPU), 0, 100)
 			}
@@ -585,7 +662,7 @@ func (s *Sampler) readProcs(snap *model.Snapshot, now time.Time, gpuByPid map[ui
 				p.WriteBps = float64(in.WriteB-prev.writeB) / dt
 			}
 		}
-		next[in.PID] = procAcc{cpu: in.CPU100ns, readB: in.ReadB, writeB: in.WriteB}
+		next[in.PID] = procAcc{create: in.Create, cpu: in.CPU100ns, readB: in.ReadB, writeB: in.WriteB}
 		procs = append(procs, p)
 	}
 	s.prevProcs = next

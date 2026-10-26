@@ -25,6 +25,7 @@ var (
 	procPdhCollect   = modPDH.NewProc("PdhCollectQueryData")
 	procPdhCloseQ    = modPDH.NewProc("PdhCloseQuery")
 	procPdhRawArray  = modPDH.NewProc("PdhGetRawCounterArrayW")
+	procPdhTimeBase  = modPDH.NewProc("PdhGetCounterTimeBase")
 )
 
 const (
@@ -110,6 +111,18 @@ func (q *PDHQuery) Collects() int { return q.collects }
 type PDHCounter struct {
 	handle uintptr
 	path   string
+}
+
+// TimeBase 返回计数器的时间基准（每秒 tick 数）。
+// PERF_AVERAGE_TIMER 类计数器必须用它换算；不可得时回退 1e7（QPC 10MHz，
+// 绝大多数现代平台的实际值）。
+func (c *PDHCounter) TimeBase() float64 {
+	var base uint64
+	r, _, _ := procPdhTimeBase.Call(c.handle, uintptr(unsafe.Pointer(&base)))
+	if r != 0 || base == 0 {
+		return 1e7
+	}
+	return float64(base)
 }
 
 // PDHRawItem 一个实例的原始计数器值。
