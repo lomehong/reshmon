@@ -1,0 +1,27 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test ./... -count=1
+      - name: Build
+        run: go build -trimpath -ldflags "-s -w" -o reshmon.exe ./cmd/reshmon
+      - name: Package
+        run: Compress-Archive -Path reshmon.exe,README.md -DestinationPath reshmon-${{ github.ref_name }}-windows-amd64.zip
+      - name: Create release with assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ github.ref_name }} "reshmon-${{ github.ref_name }}-windows-amd64.zip" --title "reshmon ${{ github.ref_name }}" --generate-notes
