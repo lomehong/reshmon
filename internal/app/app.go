@@ -53,6 +53,7 @@ type App struct {
 	errors     []string
 	errSeen    map[string]bool
 	prevStatus map[string]string
+	pending    map[string]pendingInc // 挂起中的状态迁移（防抖确认期）
 	tickN      int
 
 	stopCh chan struct{}
@@ -82,6 +83,7 @@ func Start(cfg Config) (*App, error) {
 		judge:      health.NewJudge(cfg.Thresholds, cfg.JudgeTicks),
 		errSeen:    map[string]bool{},
 		prevStatus: map[string]string{},
+		pending:    map[string]pendingInc{},
 		stopCh:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
 		lock:       lock,
@@ -187,28 +189,63 @@ func (a *App) step(baseline bool) {
 	a.mu.Unlock()
 }
 
+// minDwellMs 状态迁移确认的最小驻留时长：迁移发生后须在新档位停留
+// 达此时长才落事件；期间回到原状态视为抖动脉冲直接丢弃，跳到第三档
+// 则立即确认原迁移并挂起新迁移。11-06 实测一天 78 条事件多为秒级往返
+// 脉冲，此机制把时间线还给真实持续的异常。事件时间戳仍是迁移首次
+// 观察时刻（防抖只延迟确认，不改时间）。
+const minDwellMs = 30_000
+
+// pendingInc 挂起中的迁移（仅 loop 协程触碰，无需锁）。
+type pendingInc struct {
+	inc     store.Incident // T = 迁移首次观察时刻
+	sinceMs int64
+}
+
 func (a *App) recordTransitions(rep health.Report, snap *model.Snapshot) {
 	cur := rep.StatusMap()
+	nowMs := snap.TS.UnixMilli()
+	var confirmed []store.Incident
 	for key, st := range cur {
-		if prev, had := a.prevStatus[key]; had && prev != st {
-			inc := store.Incident{
-				T:      snap.TS.UnixMilli(),
-				Dim:    key,
-				From:   prev,
-				To:     st,
-				Detail: dimDetail(rep, key),
+		if p, has := a.pending[key]; has {
+			switch {
+			case st == p.inc.From:
+				delete(a.pending, key) // 回到原状态：抖动脉冲，整体丢弃（prevStatus 不动）
+			case st != p.inc.To:
+				// 跳到第三档（如 ok→warn 途中冲到 sat）：原迁移成立，新迁移挂起
+				confirmed = append(confirmed, p.inc)
+				a.pending[key] = pendingInc{
+					inc:     store.Incident{T: nowMs, Dim: key, From: p.inc.To, To: st, Detail: dimDetail(rep, key)},
+					sinceMs: nowMs,
+				}
+			case nowMs-p.sinceMs >= minDwellMs:
+				confirmed = append(confirmed, p.inc) // 驻留达标：确认
+				delete(a.pending, key)
+				a.prevStatus[key] = st
 			}
-			// 内存事件始终记录（-no-record 时时间线才可用）；落盘按配置。
-			a.mu.Lock()
-			a.incAll = append(a.incAll, inc)
-			if len(a.incAll) > incKeep {
-				a.incAll = a.incAll[len(a.incAll)-incKeep:]
-			}
-			a.mu.Unlock()
-			a.incLog.Append(inc)
+			continue
 		}
+		if prev, had := a.prevStatus[key]; had {
+			if prev != st {
+				a.pending[key] = pendingInc{
+					inc:     store.Incident{T: nowMs, Dim: key, From: prev, To: st, Detail: dimDetail(rep, key)},
+					sinceMs: nowMs,
+				}
+			}
+			continue
+		}
+		a.prevStatus[key] = st // 首次观察：建立基线，不产生事件
 	}
-	a.prevStatus = cur
+	for _, inc := range confirmed {
+		// 内存事件始终记录（-no-record 时时间线才可用）；落盘按配置。
+		a.mu.Lock()
+		a.incAll = append(a.incAll, inc)
+		if len(a.incAll) > incKeep {
+			a.incAll = a.incAll[len(a.incAll)-incKeep:]
+		}
+		a.mu.Unlock()
+		a.incLog.Append(inc)
+	}
 }
 
 func dimDetail(rep health.Report, key string) string {
@@ -305,10 +342,14 @@ func TotalsFrom(s *model.Snapshot) model.Totals {
 		})
 	}
 	for _, g := range s.GPUs {
+		key := g.StableKey
+		if key == "" {
+			key = g.LUIDKey // 防御：未分配稳定键时退回 LUID
+		}
 		t.GPUs = append(t.GPUs, model.GPUTotal{
-			// 身份键用 LUID（稳定）；DXGI 命名失败只影响显示名，
-			// 不再让同一块 GPU 的健康维度/事件序列一分为二。
-			Key: g.LUIDKey, Name: g.Name, Util: g.UtilCapPct, VramPct: GPUVramPct(g),
+			// 身份键用跨开机稳定的设备名键（LUID 每次开机重新生成，会让
+			// 健康维度/事件序列在重启后断裂）；DXGI 命名失败只影响显示名。
+			Key: key, Name: g.Name, Util: g.UtilCapPct, VramPct: GPUVramPct(g),
 		})
 	}
 	nr, ns := NicTotals(s.NICs)
