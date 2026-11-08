@@ -92,12 +92,13 @@ func Start(cfg Config) (*App, error) {
 		a.addErr("历史记录已停用：" + lockErr.Error())
 	}
 	if cfg.ETW {
-		// 短命进程 IO 归因（ETW）：需要管理员，失败只降级不阻断。
-		if tr, terr := syswin.StartEphemeralTracker(); terr == nil {
+		// 短命进程归因（ETW）：需要管理员，失败只降级不阻断。
+		// IO 走 DiskIO 事件精确配对；CPU 走 SampledProfile 采样比例归因。
+		if tr, terr := syswin.StartEphemeralTracker(cfg.ETWCPU); terr == nil {
 			a.etw = tr
 			s.AttachEphemeral(tr)
 		} else {
-			a.addErr("短命进程 IO 追踪（ETW）不可用：" + terr.Error())
+			a.addErr("短命进程归因（ETW）不可用：" + terr.Error())
 		}
 	}
 	a.loadIncidentBaseline()

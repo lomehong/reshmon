@@ -131,6 +131,32 @@ func TestWarpLUIDSet(t *testing.T) {
 	}
 }
 
+// CPU 缺口比例归因：按采样占比分配，免校准；边界（零缺口/零样本/空池）返回 nil。
+func TestSplitGapCPU(t *testing.T) {
+	split := splitGapCPU(60, map[uint32]uint64{100: 300, 200: 100})
+	if len(split) != 2 || split[100] != 45 || split[200] != 15 {
+		t.Fatalf("比例拆分错误: %+v", split)
+	}
+	// 单个进程独占缺口
+	split = splitGapCPU(90, map[uint32]uint64{7: 12})
+	if split[7] != 90 {
+		t.Fatalf("独占缺口错误: %+v", split)
+	}
+	// 零缺口 / 零样本 / 空池
+	if splitGapCPU(0, map[uint32]uint64{1: 5}) != nil {
+		t.Fatal("零缺口应返回 nil")
+	}
+	if splitGapCPU(-3, map[uint32]uint64{1: 5}) != nil {
+		t.Fatal("负缺口应返回 nil")
+	}
+	if splitGapCPU(50, map[uint32]uint64{1: 0}) != nil {
+		t.Fatal("零样本应返回 nil")
+	}
+	if splitGapCPU(50, nil) != nil {
+		t.Fatal("空池应返回 nil")
+	}
+}
+
 // 跨开机稳定身份键：设备名优先；同名多卡加序号；命名回退卡用 LUID。
 func TestAssignStableKeys(t *testing.T) {
 	gpus := []model.GPUStat{

@@ -42,6 +42,7 @@ const (
 	flagDiskIO                = 0x00000100
 	flagDiskIOInit            = 0x00000400
 	flagNoSysConfig           = 0x10000000
+	flagProfile               = 0x01000000 // SampledProfile：短命进程 CPU 采样
 	processTraceModeRealTime  = 0x00000100
 	processTraceModeEventRec  = 0x10000000
 	eventTraceControlStop     = 1
@@ -56,6 +57,11 @@ const (
 	procEvtEnd                = 2
 	procEvtDCStart            = 3
 	procEvtDCEnd              = 4
+	perfEvtSampledProfile     = 46
+	// etwProfileRateGuard SampledProfile 事件速率护栏（条/秒）：默认间隔
+	// 下 16 核 ≈ 16k/s，护栏放 4 倍余量；持续超限说明采样间隔被系统调成
+	// 极小值，停用 CPU 采样记账避免回调开销失控（事件仍会产生，丢弃）。
+	etwProfileRateGuard = 64000
 )
 
 var (
@@ -63,14 +69,17 @@ var (
 		Data4: [8]byte{0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}}
 	guidProcess = windows.GUID{Data1: 0x3d6fa8d0, Data2: 0xfe05, Data3: 0x11d0,
 		Data4: [8]byte{0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}}
+	guidPerfInfo = windows.GUID{Data1: 0xce1dbfb4, Data2: 0x137e, Data3: 0x4da6,
+		Data4: [8]byte{0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc}}
 )
 
-// EphemeralProc 一个已退出（或采样枚举不可见）进程的本窗未结算 IO。
+// EphemeralProc 一个已退出（或采样枚举不可见）进程的本窗未结算账目。
 type EphemeralProc struct {
 	PID, PPID     uint32
 	Name          string
 	Create        uint64 // 进程启动时间戳（FILETIME 100ns）
 	ReadB, WriteB uint64
+	Samples       uint64 // SampledProfile 采样数（短命进程 CPU 比例归因用）
 }
 
 // ---- FFI 结构体（amd64 布局，与 evntrace.h/evntcons.h 对齐；编译期断言钉死） ----
@@ -236,6 +245,7 @@ type etwProcEntry struct {
 	name              string
 	create            uint64
 	winRead, winWrite uint64 // 自上次 Consume 以来的字节
+	winSamples        uint64 // 自上次 Consume 以来的 SampledProfile 采样数
 	dead              bool
 }
 
@@ -254,6 +264,13 @@ type etwState struct {
 	irpSeq      uint64
 	irpOld      []uintptr // FIFO 驱逐序
 	unmatchedIO uint64
+
+	// SampledProfile 速率护栏（事件消费线程独占写，无需锁）：
+	// guardStart 为窗口起点毫秒，guardEvents 为窗口内事件数。
+	profileOff   bool
+	guardStart   int64
+	guardEvents  uint64
+	profileTotal uint64 // 累计样本数（诊断用）
 }
 
 func newEtwState() *etwState {
@@ -279,14 +296,14 @@ func (st *etwState) trimProcs() {
 }
 
 func (st *etwState) finalize(e *etwProcEntry) {
-	if e.winRead == 0 && e.winWrite == 0 {
+	if e.winRead == 0 && e.winWrite == 0 && e.winSamples == 0 {
 		return
 	}
 	st.dead = append(st.dead, EphemeralProc{
 		PID: e.pid, PPID: e.ppid, Name: e.name, Create: e.create,
-		ReadB: e.winRead, WriteB: e.winWrite,
+		ReadB: e.winRead, WriteB: e.winWrite, Samples: e.winSamples,
 	})
-	e.winRead, e.winWrite = 0, 0
+	e.winRead, e.winWrite, e.winSamples = 0, 0, 0
 }
 
 // onDiskInit DiskIo ReadInit/WriteInit：UserData = {Irp ptr@0}（TypeGroup2，
@@ -413,17 +430,52 @@ func printableASCII(s string) bool {
 	return len(s) > 0
 }
 
-// Consume 取走 pid 自上次结算以来的 IO 字节并清零（进程继续跟踪）。
-func (st *etwState) Consume(pid uint32) (read, write uint64) {
+// onProfile SampledProfile（PerfInfo type 46，UserData={IP ptr,ThreadId,Count}，
+// 进程身份取自事件头）：按 PID 累计采样数。比例归因不依赖采样间隔的
+// 绝对值，无需校准。PID 0（System Idle）跳过——空闲时间不是缺口的一部分。
+// 速率护栏：持续超过 etwProfileRateGuard 时停用记账（事件照旧丢弃）。
+func (st *etwState) onProfile(pid uint32, nowMs int64) {
+	if st.profileOff || pid == 0 {
+		return
+	}
+	if st.guardStart == 0 {
+		st.guardStart = nowMs
+	}
+	st.guardEvents++
+	st.profileTotal++
+	if st.guardEvents >= 4096 {
+		delta := nowMs - st.guardStart
+		if delta < 1 {
+			delta = 1 // 同毫秒灌爆：按 1ms 计，速率必然爆表触发护栏
+		}
+		if st.guardEvents*1000/uint64(delta) > etwProfileRateGuard {
+			st.profileOff = true
+			return
+		}
+		st.guardStart, st.guardEvents = nowMs, 0
+	}
+	st.mu.Lock()
+	e := st.procEntryLocked(pid, 0)
+	e.winSamples++
+	st.mu.Unlock()
+}
+
+// ProfileOff 速率护栏是否已触发（诊断展示用）。
+func (st *etwState) ProfileOff() bool { return st.profileOff }
+
+// Consume 取走 pid 自上次结算以来的 IO 字节与 CPU 采样数并清零
+// （进程继续跟踪）。已由常规差分覆盖的进程也须调用（丢弃返回值），
+// 防止计数滞留到死后被重复结算。
+func (st *etwState) Consume(pid uint32) (read, write, samples uint64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	e := st.procs[pid]
 	if e == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
-	read, write = e.winRead, e.winWrite
-	e.winRead, e.winWrite = 0, 0
-	return read, write
+	read, write, samples = e.winRead, e.winWrite, e.winSamples
+	e.winRead, e.winWrite, e.winSamples = 0, 0, 0
+	return read, write, samples
 }
 
 // TakeDead 结算已不存活于当前枚举中的条目：未结算字节转为一次性归因记录。
@@ -452,11 +504,13 @@ type EphemeralTracker struct {
 	traceHandle  uint64
 	callback     uintptr
 	stopped      chan struct{}
+	profileCPU   bool // 会话含 SampledProfile 标志（CPU 比例归因）
 }
 
-// StartEphemeralTracker 启动内核 ETW 会话（"reshmon"，DiskIO+Process）并
-// 开始实时消费。需要管理员权限；错误时调用方应降级继续运行。
-func StartEphemeralTracker() (*EphemeralTracker, error) {
+// StartEphemeralTracker 启动内核 ETW 会话（"reshmon"，DiskIO+Process，
+// 可选 SampledProfile）并开始实时消费。需要管理员权限；错误时调用方
+// 应降级继续运行。profileCPU 控制采样剖析标志（短命进程 CPU 归因）。
+func StartEphemeralTracker(profileCPU bool) (*EphemeralTracker, error) {
 	name, _ := windows.UTF16PtrFromString(etwSessionName)
 
 	propsBuf := make([]byte, 120+264) // struct(120) + LoggerName 缓冲
@@ -471,6 +525,9 @@ func StartEphemeralTracker() (*EphemeralTracker, error) {
 	props.FlushTimer = 1
 	props.BufferSize = 64 // KB
 	props.EnableFlags = flagProcess | flagDiskIO | flagDiskIOInit | flagNoSysConfig
+	if profileCPU {
+		props.EnableFlags |= flagProfile
+	}
 	props.LoggerNameOffset = 120
 	props.LogFileNameOffset = 0 // 仅实时，不落 .etl 文件
 
@@ -480,7 +537,8 @@ func StartEphemeralTracker() (*EphemeralTracker, error) {
 	if uint32(r) == errAlreadyExists {
 		// 会话已存在（另一 reshmon 实例持有，或上次异常退出的残留）：
 		// 实时会话支持多消费者——直接附加消费，绝不拆掉重启（那会掐断
-		// 先来实例的句柄）。附加失败才回退到停旧建新。
+		// 先来实例的句柄）。附加时 Profile 标志以会话创建者的为准。
+		// 附加失败才回退到停旧建新。
 		if t, err := attachEphemeralTracker(name); err == nil {
 			return t, nil
 		}
@@ -501,6 +559,7 @@ func StartEphemeralTracker() (*EphemeralTracker, error) {
 		sessionProps: propsBuf,
 		sessionOK:    true, // 本实例 StartTrace 成功：Stop 时负责回收会话
 		stopped:      make(chan struct{}),
+		profileCPU:   profileCPU,
 	}
 	if err := t.openAndConsume(name); err != nil {
 		t.stopSession()
@@ -571,13 +630,18 @@ func (t *EphemeralTracker) onEvent(rec uintptr) uintptr {
 				t.state.onProcessEnd(binary.LittleEndian.Uint32(data[8:12]))
 			}
 		}
+	case guidPerfInfo:
+		if r.EventHeader.EventDescriptor.Id == perfEvtSampledProfile && t.profileCPU {
+			// 时间戳为系统时间（100ns）→ 毫秒
+			t.state.onProfile(r.EventHeader.ProcessId, r.EventHeader.TimeStamp/10000)
+		}
 	}
 	return 0
 }
 
-// Consume 结算某 PID 本窗 IO 字节（存活进程防双计：常规差分已覆盖时调用
-// 并丢弃返回值；首拍/受保护进程则把返回值并入速率）。
-func (t *EphemeralTracker) Consume(pid uint32) (read, write uint64) {
+// Consume 结算某 PID 本窗 IO 字节与 CPU 采样数（存活进程防双计：常规
+// 差分已覆盖时调用并丢弃返回值；首拍/受保护进程则把返回值并入速率/缺口）。
+func (t *EphemeralTracker) Consume(pid uint32) (read, write, samples uint64) {
 	return t.state.Consume(pid)
 }
 

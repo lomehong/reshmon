@@ -370,6 +370,27 @@ func timerOrRaw(key string, p, now rawVal, timebase float64) float64 {
 	}
 }
 
+// splitGapCPU 把"未归因 CPU 缺口"按采样占比分配给各 PID（免校准的比例
+// 归因：不依赖采样间隔的绝对值）。gap≤0 或无样本时返回 nil（缺口放弃，
+// 不硬摊）。结果恒 ≤ gap ≤ 100。
+func splitGapCPU(gap float64, samples map[uint32]uint64) map[uint32]float64 {
+	if gap <= 0 || len(samples) == 0 {
+		return nil
+	}
+	var total uint64
+	for _, s := range samples {
+		total += s
+	}
+	if total == 0 {
+		return nil
+	}
+	out := make(map[uint32]float64, len(samples))
+	for pid, s := range samples {
+		out[pid] = gap * float64(s) / float64(total)
+	}
+	return out
+}
+
 // warpLUIDSet 提取 WARP（软件渲染回退）适配器的 LUID 集合。
 func warpLUIDSet(adapters []syswin.DXGIAdapter) map[string]bool {
 	warp := map[string]bool{}
@@ -668,10 +689,11 @@ func (s *Sampler) readMem(snap *model.Snapshot) {
 	}
 }
 
-// EphemeralSource 短命进程 IO 的补充数据源（ETW 实现；测试可注入伪源）。
-// Consume 结算某 PID 本窗字节；TakeDead 取出已退出进程的一次性归因记录。
+// EphemeralSource 短命进程的补充数据源（ETW 实现；测试可注入伪源）。
+// Consume 结算某 PID 本窗 IO 字节与 CPU 采样数；TakeDead 取出已退出
+// 进程的一次性归因记录。
 type EphemeralSource interface {
-	Consume(pid uint32) (read, write uint64)
+	Consume(pid uint32) (read, write, samples uint64)
 	TakeDead(alive map[uint32]bool) []syswin.EphemeralProc
 }
 
@@ -691,6 +713,8 @@ func (s *Sampler) readProcs(snap *model.Snapshot, now time.Time, gpuByPid map[ui
 	procs := make([]model.ProcStat, 0, len(infos))
 	next := make(map[uint32]procAcc, len(infos))
 	alive := map[uint32]bool{}
+	undiffedSamples := map[uint32]uint64{} // 首拍/受保护进程的 CPU 采样（缺口归因用）
+	idxByPID := make(map[uint32]int, len(infos))
 	for _, in := range infos {
 		alive[in.PID] = true
 		p := model.ProcStat{
@@ -709,11 +733,13 @@ func (s *Sampler) readProcs(snap *model.Snapshot, now time.Time, gpuByPid map[ui
 		// 身份键 = PID + 创建时间：PID 被复用时基线作废（首拍速率置 0），
 		// 不把前任进程的累计值差分到新进程头上。
 		prev, hadPrev := s.prevProcs[in.PID]
-		diffed := false
+		cpuDiffed := false
+		ioDiffed := false
 		if hadPrev && dt > 0.05 && prev.create == in.Create {
 			if in.CPU100ns >= prev.cpu {
 				p.CpuPct = clamp(float64(in.CPU100ns-prev.cpu)/(dt*1e7)*100/float64(s.numCPU), 0, 100)
 			}
+			cpuDiffed = in.CPU100ns > 0 || prev.cpu > 0 // GetProcessTimes 可用即视为 CPU 已覆盖
 			if in.ReadB >= prev.readB {
 				p.ReadBps = float64(in.ReadB-prev.readB) / dt
 			}
@@ -721,21 +747,27 @@ func (s *Sampler) readProcs(snap *model.Snapshot, now time.Time, gpuByPid map[ui
 				p.WriteBps = float64(in.WriteB-prev.writeB) / dt
 			}
 			// GetProcessIoCounters 计数可用（本拍或上拍非全零）→ 差分已覆盖。
-			diffed = in.ReadB > 0 || in.WriteB > 0 || prev.readB > 0 || prev.writeB > 0
+			ioDiffed = in.ReadB > 0 || in.WriteB > 0 || prev.readB > 0 || prev.writeB > 0
 		}
-		// ETW 补充：首拍/受保护进程（差分不可用）把本窗 ETW 字节并入速率；
-		// 已覆盖的进程也要 Consume 掉，防止字节滞留到死后被重复结算。
-		if s.eph != nil && dt > 0.05 && !diffed {
-			if r, w := s.eph.Consume(in.PID); r > 0 || w > 0 {
+		// ETW 补充：首拍/受保护进程（差分不可用）把本窗 ETW 字节并入速率，
+		// CPU 采样进缺口归因池；已覆盖的进程也要 Consume 掉，防止计数
+		// 滞留到死后被重复结算。
+		if s.eph != nil && dt > 0.05 {
+			r, w, smp := s.eph.Consume(in.PID)
+			if !ioDiffed && (r > 0 || w > 0) {
 				p.ReadBps += float64(r) / dt
 				p.WriteBps += float64(w) / dt
 			}
+			if !cpuDiffed && smp > 0 {
+				undiffedSamples[in.PID] = smp
+			}
 		}
+		idxByPID[in.PID] = len(procs)
 		next[in.PID] = procAcc{create: in.Create, cpu: in.CPU100ns, readB: in.ReadB, writeB: in.WriteB}
 		procs = append(procs, p)
 	}
-	// 已退出进程的未结算 IO 转为一次性归因记录（其整段生命的字节都记在
-	// 本拍窗口上，速率口径偏高但总量正确）。
+	// 已退出进程的未结算账目转为一次性归因记录（其整段生命的字节/采样
+	// 都记在本拍窗口上，速率口径偏高但总量正确）。
 	var ephs []model.ProcStat
 	if s.eph != nil && dt > 0.05 {
 		for _, d := range s.eph.TakeDead(alive) {
@@ -743,6 +775,32 @@ func (s *Sampler) readProcs(snap *model.Snapshot, now time.Time, gpuByPid map[ui
 				PID: d.PID, PPID: d.PPID, Name: d.Name, Start: d.Create,
 				ReadBps: float64(d.ReadB) / dt, WriteBps: float64(d.WriteB) / dt,
 			})
+			if d.Samples > 0 {
+				undiffedSamples[d.PID] += d.Samples
+			}
+		}
+	}
+	// CPU 缺口比例归因：总 CPU%（PDH 精确）− Σ已差分进程 = 短命/首拍/
+	// 受保护进程吃掉的 CPU，按 SampledProfile 采样占比分配——免校准，
+	// Agent 账本之和收敛到总量。DPC/ISR 等无样本的残余缺口放弃不硬摊。
+	if len(undiffedSamples) > 0 {
+		var attributed float64
+		for i := range procs {
+			attributed += procs[i].CpuPct
+		}
+		if gap := snap.CPU.BusyPct - attributed; gap > 0 {
+			for pid, share := range splitGapCPU(gap, undiffedSamples) {
+				if idx, ok := idxByPID[pid]; ok {
+					procs[idx].CpuPct = clamp(procs[idx].CpuPct+share, 0, 100)
+				} else {
+					for i := range ephs { // 死进程的一次性记录
+						if ephs[i].PID == pid {
+							ephs[i].CpuPct = clamp(share, 0, 100)
+							break
+						}
+					}
+				}
+			}
 		}
 	}
 	s.prevProcs = next

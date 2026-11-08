@@ -46,17 +46,17 @@ func TestIrpPairing(t *testing.T) {
 	// 完成：IRP 0xA000 属于 100，但事件在"别的"上下文（headerPid=4）
 	st.onDiskDone(4, diskEvtRead, mkDiskDone(4096, 0xA000))
 	st.onDiskDone(4, diskEvtWrite, mkDiskDone(8192, 0xA001))
-	r1, w1 := st.Consume(100)
+	r1, w1, _ := st.Consume(100)
 	if r1 != 4096 || w1 != 0 {
 		t.Fatalf("pid100 归账错误: r=%d w=%d", r1, w1)
 	}
-	r2, w2 := st.Consume(200)
+	r2, w2, _ := st.Consume(200)
 	if r2 != 0 || w2 != 8192 {
 		t.Fatalf("pid200 归账错误: r=%d w=%d", r2, w2)
 	}
 	// 未配对的 Init（会话中途启动等）：回退用完成事件 header PID
 	st.onDiskDone(777, diskEvtRead, mkDiskDone(512, 0xDEAD))
-	if r, _ := st.Consume(777); r != 512 {
+	if r, _, _ := st.Consume(777); r != 512 {
 		t.Fatalf("未配对 IO 应回退 header PID: %d", r)
 	}
 }
@@ -66,10 +66,10 @@ func TestConsumeAndTakeDead(t *testing.T) {
 	st := newEtwState()
 	st.onDiskInit(10, mkDiskInit(1))
 	st.onDiskDone(10, diskEvtRead, mkDiskDone(1000, 1))
-	if r, _ := st.Consume(10); r != 1000 {
+	if r, _, _ := st.Consume(10); r != 1000 {
 		t.Fatal("首次 Consume 应返回累计值")
 	}
-	if r, _ := st.Consume(10); r != 0 {
+	if r, _, _ := st.Consume(10); r != 0 {
 		t.Fatal("重复 Consume 应已清零")
 	}
 	// 死进程：End 事件 + 不在存活枚举 → 剩余字节一次性结算
@@ -102,7 +102,7 @@ func TestProcessStartAndReuse(t *testing.T) {
 	}
 	st.onDiskInit(42, mkDiskInit(2))
 	st.onDiskDone(42, diskEvtWrite, mkDiskDone(64, 2))
-	if _, w := st.Consume(42); w != 64 {
+	if _, w, _ := st.Consume(42); w != 64 {
 		t.Fatal("复用后的新进程应重新累计")
 	}
 }
@@ -120,6 +120,55 @@ func TestProcessImageName(t *testing.T) {
 	}
 	if got := processImageName([]byte{1, 0, 0, 0, 0x01, 0x02}); got != "" {
 		t.Fatalf("不可打印名应返回空: %q", got)
+	}
+}
+
+// SampledProfile 计数：按 PID 累计；PID 0（空闲）跳过；Consume 清零；
+// TakeDead 携带采样数；速率护栏触发后停用。
+func TestProfileSamples(t *testing.T) {
+	st := newEtwState()
+	base := int64(1_000_000) // ms
+	for i := 0; i < 30; i++ {
+		st.onProfile(100, base+int64(i)) // 每毫秒一样本
+		st.onProfile(200, base+int64(i))
+		st.onProfile(0, base+int64(i)) // System Idle：必须跳过
+	}
+	if _, _, s := st.Consume(100); s != 30 {
+		t.Fatalf("pid100 采样计数错误: %d", s)
+	}
+	if _, _, s := st.Consume(100); s != 0 {
+		t.Fatalf("Consume 后应清零: %d", s)
+	}
+	if _, _, s := st.Consume(0); s != 0 {
+		t.Fatalf("PID 0 不得累计: %d", s)
+	}
+	if _, _, s := st.Consume(200); s != 30 { // 清掉 pid200，别混入死者结算
+		t.Fatalf("pid200 采样计数错误: %d", s)
+	}
+	// 死者结算带采样数
+	st.onProfile(300, base)
+	st.onProfile(300, base+1)
+	st.onProcessEnd(300)
+	dead := st.TakeDead(map[uint32]bool{})
+	if len(dead) != 1 || dead[0].Samples != 2 {
+		t.Fatalf("死者采样结算错误: %+v", dead)
+	}
+	// 速率护栏：同一毫秒内灌 4096+ 事件 → 窗口时长按 ≥1ms 计，速率爆表，
+	// 护栏触发；触发前的事件已入账（4095），触发后停账。
+	st2 := newEtwState()
+	for i := 0; i < 5000; i++ {
+		st2.onProfile(777, base) // 全部同一毫秒
+	}
+	if !st2.ProfileOff() {
+		t.Fatal("同毫秒灌爆应触发速率护栏")
+	}
+	_, _, s2 := st2.Consume(777)
+	if s2 < 4000 || s2 > 4095 {
+		t.Fatalf("护栏触发前的事件应已入账: %d", s2)
+	}
+	st2.onProfile(777, base)
+	if _, _, s3 := st2.Consume(777); s3 != 0 {
+		t.Fatalf("护栏触发后不得继续累计: %d", s3)
 	}
 }
 

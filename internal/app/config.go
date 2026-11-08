@@ -14,7 +14,7 @@ import (
 )
 
 // Version 工具版本（唯一出处，CLI 与面板共用）。
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 // 时长基准（窗口/频率以时间为源，间隔改变时承诺不漂移）：
 const (
@@ -43,6 +43,9 @@ type Config struct {
 	Record        bool
 	// ETW 用内核事件补齐短命进程的 IO 归因（需要管理员；不可用时自动降级）。
 	ETW bool
+	// ETWCPU 在 ETW 会话上加 SampledProfile 采样，按比例归因补齐短命
+	// 进程的 CPU（同样需要管理员；默认开）。
+	ETWCPU bool
 }
 
 // DefaultDataDir 默认数据目录：%LOCALAPPDATA%\reshmon。
@@ -64,6 +67,7 @@ func DefaultConfig() Config {
 		Patterns:      attrib.DefaultPatterns(),
 		Record:        true,
 		ETW:           true,
+		ETWCPU:        true,
 	}
 }
 
@@ -107,6 +111,7 @@ func LoadConfig(dataDir string) (Config, []string) {
 		ProcEverySec  int                `json:"procEverySec"`
 		RetentionDays int                `json:"retentionDays"`
 		ETW           *bool              `json:"etwIO"`
+		ETWCPU        *bool              `json:"etwCPU"`
 		Thresholds    *health.Thresholds `json:"thresholds"`
 	}
 	cfgPath := filepath.Join(cfg.DataDir, "config.json")
@@ -129,6 +134,9 @@ func LoadConfig(dataDir string) (Config, []string) {
 			if fc.ETW != nil {
 				cfg.ETW = *fc.ETW
 			}
+			if fc.ETWCPU != nil {
+				cfg.ETWCPU = *fc.ETWCPU
+			}
 			if fc.Thresholds != nil {
 				cfg.Thresholds = mergeThresholds(cfg.Thresholds, *fc.Thresholds)
 			}
@@ -136,8 +144,8 @@ func LoadConfig(dataDir string) (Config, []string) {
 	case os.IsNotExist(err):
 		// 模板带全默认值（thresholds 不为 null），用户改哪个都有效。
 		th := health.DefaultThresholds()
-		etw := true
-		tpl := fileCfg{IntervalMs: 2000, ProcEverySec: ProcSliceSec, RetentionDays: 14, ETW: &etw, Thresholds: &th}
+		etw, etwcpu := true, true
+		tpl := fileCfg{IntervalMs: 2000, ProcEverySec: ProcSliceSec, RetentionDays: 14, ETW: &etw, ETWCPU: &etwcpu, Thresholds: &th}
 		if b2, e := json.MarshalIndent(tpl, "", "  "); e == nil {
 			_ = os.WriteFile(cfgPath, b2, 0o644)
 		}
