@@ -74,8 +74,9 @@ type DiskStat struct {
 }
 
 type GPUStat struct {
-	LUIDKey         string  `json:"luid"` // 归一化 LUID，与 GPU 性能计数器实例对应
-	Name            string  `json:"name"` // DXGI 名称；不可得时为 "GPU <luid>"
+	LUIDKey         string  `json:"luid"`         // 归一化 LUID，与 GPU 性能计数器实例对应（每次开机重新生成）
+	StableKey       string  `json:"sk,omitempty"` // 跨开机稳定身份键（设备名优先+同名序号）——健康维度/落盘/事件用
+	Name            string  `json:"name"`         // DXGI 名称；不可得时为 "GPU <luid>"
 	Vendor          string  `json:"vendor"`
 	UtilPct         float64 `json:"utilPct"`    // 引擎利用率合计，可超 100（多引擎并行）
 	UtilCapPct      float64 `json:"utilCapPct"` // 显示用，截断 0-100

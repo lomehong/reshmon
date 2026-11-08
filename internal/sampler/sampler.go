@@ -6,6 +6,7 @@
 package sampler
 
 import (
+	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
@@ -559,7 +560,30 @@ func (s *Sampler) readGPUs(snap *model.Snapshot, cur map[string]rawSet) (gpuByPi
 		})
 	}
 	sort.Slice(snap.GPUs, func(i, j int) bool { return snap.GPUs[i].LUIDKey < snap.GPUs[j].LUIDKey })
+	assignStableKeys(snap.GPUs)
 	return gpuByPid, vramByPid
+}
+
+// assignStableKeys 为每块 GPU 生成跨开机稳定的身份键并写入 StableKey。
+// LUID 每次开机重新生成（实测同一核显两天两个 LUID），健康维度/事件序列
+// 用它会在重启后断裂；设备名跨开机稳定——同名多卡按 LUID 升序加 #序号
+// 区分，DXGI 命名失败的回退卡（"GPU 0x…"）仍用 LUID 兜底。
+// 须在 snap.GPUs 已按 LUIDKey 排序后调用（保证序号分配确定性）。
+func assignStableKeys(gpus []model.GPUStat) {
+	seen := map[string]int{}
+	for i := range gpus {
+		g := &gpus[i]
+		base := g.Name
+		if base == "" || strings.HasPrefix(base, "GPU 0x") {
+			base = g.LUIDKey // 命名失败的回退卡：键只能跟本次开机走
+		}
+		seen[base]++
+		if n := seen[base]; n > 1 {
+			g.StableKey = fmt.Sprintf("%s#%d", base, n)
+		} else {
+			g.StableKey = base
+		}
+	}
 }
 
 // nameOf 已删除：gpu mem 集合遍历时直接以 map 键为实例名。

@@ -41,7 +41,11 @@ func toolSnapshot(src Source, args json.RawMessage) (any, error) {
 		}
 	}
 	for _, g := range snap.GPUs {
-		out["gpus"].(map[string]any)[g.Name] = map[string]any{
+		key := g.StableKey
+		if key == "" {
+			key = g.Name
+		}
+		out["gpus"].(map[string]any)[key] = map[string]any{
 			"utilPct": round1(g.UtilCapPct), "vramPct": round1(vramPct(g)), "tempC": g.TempC,
 		}
 	}

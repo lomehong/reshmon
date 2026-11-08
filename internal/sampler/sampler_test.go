@@ -3,8 +3,10 @@
 package sampler
 
 import (
+	"sort"
 	"testing"
 
+	"github.com/lomehong/reshmon/internal/model"
 	"github.com/lomehong/reshmon/internal/syswin"
 )
 
@@ -126,5 +128,29 @@ func TestWarpLUIDSet(t *testing.T) {
 	}
 	if len(warpLUIDSet(nil)) != 0 {
 		t.Fatal("空适配器表应返回空集")
+	}
+}
+
+// 跨开机稳定身份键：设备名优先；同名多卡加序号；命名回退卡用 LUID。
+func TestAssignStableKeys(t *testing.T) {
+	gpus := []model.GPUStat{
+		{LUIDKey: "0xb_0x2", Name: "AMD Radeon(TM) 860M Graphics"},
+		{LUIDKey: "0xa_0x1", Name: "AMD Radeon(TM) 860M Graphics"}, // 同名双卡（排序在前 → 不带序号）
+		{LUIDKey: "0xc_0x3", Name: "GPU 0xc_0x3"},                  // DXGI 命名失败的回退卡
+		{LUIDKey: "0xd_0x4", Name: "NVIDIA GeForce RTX 4090"},
+	}
+	// readGPUs 里先按 LUIDKey 排序再分配
+	sort.Slice(gpus, func(i, j int) bool { return gpus[i].LUIDKey < gpus[j].LUIDKey })
+	assignStableKeys(gpus)
+	want := map[string]string{
+		"0xa_0x1": "AMD Radeon(TM) 860M Graphics",
+		"0xb_0x2": "AMD Radeon(TM) 860M Graphics#2",
+		"0xc_0x3": "0xc_0x3", // 命名回退卡：键用裸 LUID（与历史落盘键一致）
+		"0xd_0x4": "NVIDIA GeForce RTX 4090",
+	}
+	for _, g := range gpus {
+		if g.StableKey != want[g.LUIDKey] {
+			t.Fatalf("LUID %s 稳定键 = %q want %q", g.LUIDKey, g.StableKey, want[g.LUIDKey])
+		}
 	}
 }
