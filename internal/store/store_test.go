@@ -187,13 +187,12 @@ func TestStartupBackfillGzip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 直接调用 repairDir 语义（NewWriter 内部同样路径）
-	w, err := NewWriter(dir, 1, 14)
+	// 用注入时钟构造（NewWriter 内部同样路径）：修复/清理在构造期即以
+	// 注入的"今天"执行——与真实日期解耦，不再是时间炸弹。
+	w, err := newWriterClock(dir, 1, 14, func() time.Time { return today })
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.SetNow(func() time.Time { return today })
-	w.repairDir(today)
 	w.Close()
 
 	if _, err := os.Stat(totalsPath(dir, day) + ".gz"); err != nil {

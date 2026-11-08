@@ -33,13 +33,20 @@ type Writer struct {
 }
 
 func NewWriter(dir string, procEvery, retentionDays int) (*Writer, error) {
+	return newWriterClock(dir, procEvery, retentionDays, time.Now)
+}
+
+// newWriterClock 可注入时钟的构造：repairDir/prune 在构造期内即依赖
+// 「今天」，测试必须先定钟再触发——否则测试写死的日期一过真实时钟
+// 就会把"今天的活跃文件"补压缩掉（时间炸弹）。
+func newWriterClock(dir string, procEvery, retentionDays int, now func() time.Time) (*Writer, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 	if procEvery < 1 {
 		procEvery = 1
 	}
-	w := &Writer{dir: dir, procEvery: procEvery, retention: retentionDays, nowFn: time.Now}
+	w := &Writer{dir: dir, procEvery: procEvery, retention: retentionDays, nowFn: now}
 	// 先修复历史（崩溃残留/漏压缩），再清理过期文件。
 	w.repairDir(w.nowFn())
 	w.prune()
