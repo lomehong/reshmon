@@ -97,6 +97,9 @@ func Start(cfg Config) (*App, error) {
 		if tr, terr := syswin.StartEphemeralTracker(cfg.ETWCPU); terr == nil {
 			a.etw = tr
 			s.AttachEphemeral(tr)
+			if cfg.ETWCPU && !tr.CPUActive() {
+				a.addErr("CPU 采样归因未启用（SeSystemProfilePrivilege 特权不可用），IO 归因正常")
+			}
 		} else {
 			a.addErr("短命进程归因（ETW）不可用：" + terr.Error())
 		}

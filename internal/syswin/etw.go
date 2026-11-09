@@ -32,6 +32,8 @@ var (
 	procOpenTrace    = modAdvapi.NewProc("OpenTraceW")
 	procProcessTrace = modAdvapi.NewProc("ProcessTrace")
 	procCloseTrace   = modAdvapi.NewProc("CloseTrace")
+	procLookupPriv   = modAdvapi.NewProc("LookupPrivilegeValueW")
+	procAdjustPriv   = modAdvapi.NewProc("AdjustTokenPrivileges")
 )
 
 const (
@@ -47,6 +49,7 @@ const (
 	processTraceModeEventRec  = 0x10000000
 	eventTraceControlStop     = 1
 	errAlreadyExists          = 183
+	errPrivilegeNotHeld       = 1314 // 0x522：特权未启用
 	etwSessionName            = "reshmon"
 	etwMaxIrpEntries          = 1 << 16
 	etwMaxTrackedProcs        = 4096
@@ -496,6 +499,32 @@ func (st *etwState) TakeDead(alive map[uint32]bool) []EphemeralProc {
 
 // ---- 会话生命周期（syscall 薄层） ----
 
+// enableTokenPrivilege 在当前进程令牌上启用指定特权。管理员令牌默认
+// 持有 SeSystemProfilePrivilege 但处于禁用态，开采样剖析标志前必须
+// 先 AdjustTokenPrivileges 显式启用——否则 StartTrace 报 0x522。
+func enableTokenPrivilege(name string) error {
+	var luid windows.LUID
+	n, _ := windows.UTF16PtrFromString(name)
+	if r, _, _ := procLookupPriv.Call(0, uintptr(unsafe.Pointer(n)), uintptr(unsafe.Pointer(&luid))); r == 0 {
+		return fmt.Errorf("LookupPrivilegeValue(%s) 失败", name)
+	}
+	var tok windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_ADJUST_PRIVILEGES|windows.TOKEN_QUERY, &tok); err != nil {
+		return err
+	}
+	defer tok.Close()
+	// 单项 TOKEN_PRIVILEGES：{Count, LUID, SE_PRIVILEGE_ENABLED}
+	buf := struct {
+		Count uint32
+		Luid  windows.LUID
+		Attr  uint32
+	}{Count: 1, Luid: luid, Attr: 0x2}
+	if r, _, _ := procAdjustPriv.Call(uintptr(tok), 0, uintptr(unsafe.Pointer(&buf)), 0, 0, 0); r == 0 {
+		return fmt.Errorf("AdjustTokenPrivileges(%s) 失败", name)
+	}
+	return nil
+}
+
 // EphemeralTracker 一个运行中的 ETW 会话 + 实时消费者。
 type EphemeralTracker struct {
 	state        *etwState
@@ -504,14 +533,21 @@ type EphemeralTracker struct {
 	traceHandle  uint64
 	callback     uintptr
 	stopped      chan struct{}
-	profileCPU   bool // 会话含 SampledProfile 标志（CPU 比例归因）
+	profileCPU   bool // 会话实际含 SampledProfile 标志（CPU 比例归因可用）
 }
+
+// CPUActive CPU 采样归因是否在本会话生效。
+func (t *EphemeralTracker) CPUActive() bool { return t != nil && t.profileCPU }
 
 // StartEphemeralTracker 启动内核 ETW 会话（"reshmon"，DiskIO+Process，
 // 可选 SampledProfile）并开始实时消费。需要管理员权限；错误时调用方
-// 应降级继续运行。profileCPU 控制采样剖析标志（短命进程 CPU 归因）。
+// 应降级继续运行。profileCPU=true 时先启用 SeSystemProfilePrivilege
+// 再带剖析标志启动；特权不可用时自动降级为仅 IO（会话保住，CPU 缺口
+// 放弃归因）。
 func StartEphemeralTracker(profileCPU bool) (*EphemeralTracker, error) {
 	name, _ := windows.UTF16PtrFromString(etwSessionName)
+
+	profileCPU = profileCPU && enableTokenPrivilege("SeSystemProfilePrivilege") == nil
 
 	propsBuf := make([]byte, 120+264) // struct(120) + LoggerName 缓冲
 	props := (*etwTraceProperties)(unsafe.Pointer(&propsBuf[0]))
@@ -548,8 +584,11 @@ func StartEphemeralTracker(profileCPU bool) (*EphemeralTracker, error) {
 			uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(props)))
 	}
 	if r != 0 {
-		if uint32(r) == 5 { // ERROR_ACCESS_DENIED
+		switch uint32(r) {
+		case 5: // ERROR_ACCESS_DENIED
 			return nil, fmt.Errorf("需要管理员权限（系统日志器会话被拒绝）")
+		case errPrivilegeNotHeld:
+			return nil, fmt.Errorf("缺少 Profile system performance 特权（SeSystemProfilePrivilege 未启用）")
 		}
 		return nil, fmt.Errorf("启动 ETW 会话失败 0x%X", uint32(r))
 	}
@@ -569,9 +608,11 @@ func StartEphemeralTracker(profileCPU bool) (*EphemeralTracker, error) {
 }
 
 // attachEphemeralTracker 附加到已存在的 "reshmon" 会话（只消费不控制，
-// Stop 时只关自己的消费句柄，不动会话本身）。
+// Stop 时只关自己的消费句柄，不动会话本身）。各消费者独立维护状态机，
+// 会话带剖析标志时附加者照样收到 SampledProfile 事件——一律启用处理，
+// 会话没有该标志时不会有事件到达，无害。
 func attachEphemeralTracker(name *uint16) (*EphemeralTracker, error) {
-	t := &EphemeralTracker{state: newEtwState(), stopped: make(chan struct{})}
+	t := &EphemeralTracker{state: newEtwState(), stopped: make(chan struct{}), profileCPU: true}
 	if err := t.openAndConsume(name); err != nil {
 		return nil, err
 	}
