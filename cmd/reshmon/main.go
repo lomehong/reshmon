@@ -19,12 +19,15 @@ import (
 	"sort"
 	"time"
 
+	"golang.org/x/sys/windows/svc"
+
 	"github.com/lomehong/reshmon/internal/app"
 	"github.com/lomehong/reshmon/internal/health"
 	"github.com/lomehong/reshmon/internal/mcp"
 	"github.com/lomehong/reshmon/internal/model"
 	"github.com/lomehong/reshmon/internal/report"
 	"github.com/lomehong/reshmon/internal/sampler"
+	"github.com/lomehong/reshmon/internal/service"
 	"github.com/lomehong/reshmon/internal/syswin"
 	"github.com/lomehong/reshmon/internal/tui"
 	"github.com/lomehong/reshmon/internal/webui"
@@ -53,6 +56,8 @@ func main() {
 		err = cmdLive(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "service":
+		err = cmdService(os.Args[2:])
 	case "mcp":
 		err = cmdMCP(os.Args[2:])
 	case "report":
@@ -77,6 +82,7 @@ func usage() {
   reshmon once    [-json] [-obs 800ms] [-data 目录]     单次采样打印，退出码 0/1/2=健康/亚健康/饱和，3=执行错误
   reshmon live    [-data 目录] [-no-record] [-interval 1s]   终端实时面板
   reshmon serve   [-addr 127.0.0.1:8964] [-data 目录] [-no-record] [-interval 1s]   Web 面板（默认同时记录历史）
+  reshmon service [-addr …] [-data …] install|remove|start|stop|status   Windows 服务（自启/崩溃自动恢复）
   reshmon mcp     [-data 目录]   MCP 服务器（stdio）——让 Agent 自查资源后决策并发
   reshmon report  [-day 2026-10-26 | -last 24h]         回溯分析已记录的历史
   reshmon version
@@ -294,6 +300,10 @@ func cmdServe(args []string) error {
 		cfg.Interval = *interval
 		cfg.DeriveForInterval()
 	}
+	// 服务环境（SCM 启动）：进入 SCM 生命周期，阻塞至停止请求
+	if isSvc, _ := svc.IsWindowsService(); isSvc {
+		return service.RunService(cfg, *addr)
+	}
 	a, err := app.Start(cfg)
 	if err != nil {
 		return err
@@ -306,6 +316,46 @@ func cmdServe(args []string) error {
 
 	fmt.Printf("reshmon %s 面板: http://%s/   (Ctrl+C 停止)\n数据目录: %s   历史记录: %v\n", app.Version, *addr, cfg.DataDir, cfg.Record)
 	return webui.Serve(a, *addr)
+}
+
+// cmdService Windows 服务管理（install/remove/start/stop/status）。
+func cmdService(args []string) error {
+	fs := flag.NewFlagSet("service", flag.ExitOnError)
+	addr := fs.String("addr", "127.0.0.1:8964", "面板监听地址（install 时固化）")
+	dataDir := fs.String("data", "", "数据目录（install 时固化，默认当前用户目录）")
+	_ = fs.Parse(args)
+	sub := ""
+	if fs.NArg() > 0 {
+		sub = fs.Arg(0)
+	}
+	switch sub {
+	case "install":
+		cfg, _ := app.LoadConfig(*dataDir)
+		if err := service.Install(cfg, *addr); err != nil {
+			return err
+		}
+		fmt.Printf("服务已安装（自动启动+崩溃恢复，面板 %s，数据目录 %s）。\n启动: reshmon service start（或重启自动运行）\n", *addr, cfg.DataDir)
+		return nil
+	case "remove":
+		if err := service.Remove(); err != nil {
+			return err
+		}
+		fmt.Println("服务已移除。")
+		return nil
+	case "start":
+		return service.Start()
+	case "stop":
+		return service.Stop()
+	case "status":
+		st, err := service.Status()
+		if err != nil {
+			return err
+		}
+		fmt.Println("reshmon 服务:", st)
+		return nil
+	default:
+		return fmt.Errorf("用法: reshmon service [-addr …] [-data …] install|remove|start|stop|status")
+	}
 }
 
 // cmdMCP MCP 服务器（stdio）：供 AI Agent 接入——发起任务前自查资源

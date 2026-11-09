@@ -175,15 +175,24 @@ reshmon.exe report -day 2026-10-25      # 指定某天
 3. 找到"磁盘 C: D:"峰值窗口 → 看"当时 Agent"与"当时进程"两行，直接给出嫌疑人
 4. 需要更细的曲线：面板 http://127.0.0.1:8964/ 切"磁盘忙"趋势 + 事件时间线
 
-## 开机自启（可选）
+## 以 Windows 服务运行（推荐，替代开机自启计划任务）
 
-把快捷方式放进启动目录（免管理员）：
+管理员终端执行一次：
 
 ```powershell
-powershell -NoProfile -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut(\"$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\reshmon.lnk\");$s.TargetPath='D:\Develop\Projects\reshmon\bin\reshmon.exe';$s.Arguments='serve';$s.Save()"
+D:\Develop\Projects\reshmon\bin\reshmon.exe service install
+D:\Develop\Projects\reshmon\bin\reshmon.exe service start
 ```
 
-删除：`del "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\reshmon.lnk"`
+服务特性：自动启动（延迟启动不拖慢开机）、崩溃由 SCM 自动重启（5s/30s/60s 递增）、登录前即运行、services.msc 可见可管理。数据目录在 install 时固化为当前用户的默认目录，避免 LocalSystem 下路径漂移；**升级版本只需覆盖 exe 后 `reshmon.exe service stop && reshmon.exe service start`**。
+
+```powershell
+reshmon.exe service status    # 运行中 (pid 1234)
+reshmon.exe service stop      # 停止（保留注册）
+reshmon.exe service remove    # 停止并删除
+```
+
+普通权限运行 `serve`/`live` 与服务并存时，后者会因数据目录锁自动降级为只看不记录（面板有提示）。若此前配置过开机自启计划任务，迁移：`schtasks /Delete /TN reshmon /F`。
 
 ## 技术路线
 

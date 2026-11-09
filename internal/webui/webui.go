@@ -27,7 +27,11 @@ import (
 var indexHTML []byte
 
 // Serve 启动面板（阻塞，Ctrl+C 优雅退出）。
-func Serve(a *app.App, addr string) error {
+func Serve(a *app.App, addr string) error { return ServeUntil(a, addr, nil) }
+
+// ServeUntil 阻塞至 Ctrl+C 或 stop 通道关闭（服务模式传 SCM 停止信号）。
+// 返回前已优雅关闭 HTTP 服务，调用方随后自行释放 App。
+func ServeUntil(a *app.App, addr string, stop <-chan struct{}) error {
 	srv := &http.Server{Addr: addr, Handler: HandlerWithAddr(a, addr), ReadHeaderTimeout: 5 * time.Second}
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
@@ -41,6 +45,9 @@ func Serve(a *app.App, addr string) error {
 		return err
 	case <-sig:
 		// 优雅退出：让 main 的 defer 链（App.Close 释放句柄与目录锁）执行
+		_ = srv.Close()
+		return nil
+	case <-stop:
 		_ = srv.Close()
 		return nil
 	}
