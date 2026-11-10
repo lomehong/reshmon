@@ -249,6 +249,11 @@ func (a *App) recordTransitions(rep health.Report, snap *model.Snapshot) {
 		}
 		a.mu.Unlock()
 		a.incLog.Append(inc)
+		// 事件落盘失败必须可见（v0.5.0 曾静默失败 24h，重启丢掉
+		// 全部当日事件）——自愈重试期间用户必须知道时间线不完整。
+		if n, errMsg := a.incLog.Failures(); n == 1 {
+			a.addErr("事件日志写入失败，自动重试中：" + errMsg)
+		}
 	}
 }
 

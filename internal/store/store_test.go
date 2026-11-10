@@ -108,6 +108,60 @@ func TestIncidentLog(t *testing.T) {
 	}
 }
 
+// 回归（v0.5.0 实测数据丢失）：句柄级写故障必须自愈——磁盘冻结期间
+// 写在坏句柄上会持续失败，Append 必须关句柄重开重试，失败计数可见。
+func TestIncidentLogSelfHeal(t *testing.T) {
+	dir := t.TempDir()
+	l, err := OpenIncidentLog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	l.Append(Incident{T: now.Add(-2 * time.Minute).UnixMilli(), Dim: "cpu", From: "ok", To: "warn"})
+	// 模拟句柄级故障：底层句柄直接关掉（设备错误后的等价状态）
+	l.mu.Lock()
+	l.f.Close()
+	l.f = nil
+	l.mu.Unlock()
+
+	l.Append(Incident{T: now.Add(-time.Minute).UnixMilli(), Dim: "cpu", From: "warn", To: "sat"})
+	if n, msg := l.Failures(); n == 0 {
+		t.Fatal("故障期间失败计数应非零")
+	} else if msg == "" {
+		t.Fatal("失败原因应记录")
+	}
+	l.Append(Incident{T: now.UnixMilli(), Dim: "cpu", From: "sat", To: "ok"}) // 自愈重开
+	if n, _ := l.Failures(); n != 0 {
+		t.Fatalf("自愈后失败计数应清零: %d", n)
+	}
+	l.Close()
+
+	incs, err := LoadIncidents(dir, now.Add(-time.Hour), now)
+	if err != nil || len(incs) != 3 {
+		t.Fatalf("自愈后事件应完整落盘: %+v %v", incs, err)
+	}
+}
+
+// 尾部修复：冻结中断留下的残行（无换行结尾）被隔离，不影响后续追加与读取。
+func TestIncidentLogTailRepair(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "incidents.jsonl"),
+		[]byte(`{"t":1,"dim":"cpu","from":"ok","to":"warn","detai`), 0o644); err != nil { // 残行，无 \n
+		t.Fatal(err)
+	}
+	l, err := OpenIncidentLog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	l.Append(Incident{T: now.UnixMilli(), Dim: "mem", From: "ok", To: "warn"})
+	l.Close()
+	incs, err := LoadIncidents(dir, time.Unix(0, 0), now)
+	if err != nil || len(incs) != 1 || incs[0].Dim != "mem" {
+		t.Fatalf("残行应被隔离、新事件应可读: %+v %v", incs, err)
+	}
+}
+
 // 回归：fileDay 曾因 TrimSuffix 顺序（先 .jsonl 后 .gz）导致 .gz 归档
 // 永远不被 retention 识别清理——磁盘按天无限增长。
 func TestFileDayGz(t *testing.T) {

@@ -65,7 +65,9 @@ func truncateDay(t time.Time) time.Time {
 func totalsPath(dir, day string) string { return filepath.Join(dir, "totals-"+day+".jsonl") }
 func procsPath(dir, day string) string  { return filepath.Join(dir, "procs-"+day+".jsonl") }
 
-// Append 写一条总量记录（必要时先轮转）。
+// Append 写一条总量记录（必要时先轮转）。写失败即关句柄：
+// 设备错误后同一句柄会持续失败，关掉让下次调用懒开新句柄自愈
+// （否则要等午夜轮转才恢复，期间整天静默丢数据）。
 func (w *Writer) Append(t model.Totals) error {
 	if w.closed {
 		return fmt.Errorf("writer 已关闭")
@@ -82,7 +84,14 @@ func (w *Writer) Append(t model.Totals) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.fT.Write(append(b, '\n'))
+	n, err := w.fT.Write(append(b, '\n'))
+	if err != nil || n != len(b)+1 {
+		w.fT.Close()
+		w.fT = nil
+		if err == nil {
+			err = fmt.Errorf("短写 %d/%d", n, len(b)+1)
+		}
+	}
 	return err
 }
 
@@ -91,7 +100,8 @@ type ProcsRec struct {
 	Top []model.ProcStat `json:"top"`
 }
 
-// AppendProcs 写一条进程切片（调用方按 procEvery 节流）。
+// AppendProcs 写一条进程切片（调用方按 procEvery 节流）。写失败即关
+// 句柄自愈（同 Append）。
 func (w *Writer) AppendProcs(ts time.Time, procs []model.ProcStat) error {
 	if w.closed {
 		return fmt.Errorf("writer 已关闭")
@@ -108,7 +118,14 @@ func (w *Writer) AppendProcs(ts time.Time, procs []model.ProcStat) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.fP.Write(append(b, '\n'))
+	n, err := w.fP.Write(append(b, '\n'))
+	if err != nil || n != len(b)+1 {
+		w.fP.Close()
+		w.fP = nil
+		if err == nil {
+			err = fmt.Errorf("短写 %d/%d", n, len(b)+1)
+		}
+	}
 	return err
 }
 
