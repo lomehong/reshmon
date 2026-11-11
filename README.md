@@ -133,7 +133,7 @@ reshmon.exe report -day 2026-10-25      # 指定某天
 
 内置识别：zcode、claude、codex、cursor、windsurf、trae、augment、cline、gemini、copilot、qwen、kimi、droid、qoder、ollama、lmstudio、llamafile、llama-server/llama.cpp、msty、anythingllm、chatbox、comfyui、sd-webui/stable-diffusion。
 
-**落盘文件**（目录内）：`totals-YYYYMMDD.jsonl`（每 tick 总量+Agent）、`procs-YYYYMMDD.jsonl`（每约 30s 进程切片，四维度 Top 并集 100 条）、`incidents.jsonl`（状态迁移事件，面板从内存读、启动时回放）。跨天自动 gzip，超期自动清理（含 .gz 归档）；启动时自动补压缩"没跨过午夜"的遗留 raw 并修复崩溃残留的半截 .gz。环形缓冲保内存最近约 2 小时（面板用）。同一数据目录只允许一个写实例（`reshmon.lock`，持有者退出后自动接管）。
+**落盘文件**（目录内）：`totals-YYYYMMDD.jsonl`（每 tick 总量+Agent）、`procs-YYYYMMDD.jsonl`（每约 30s 进程切片，四维度 Top 并集 100 条）、`incidents.jsonl`（状态迁移事件，面板从内存读、启动时回放）。**分层保留**：原始层（2s 粒度）保留 `retentionDays` 天（默认 14）；过期日不删除而是降采样为分钟级均值 `totals-min-YYYYMMDD.jsonl.gz`（体积约 1/30）再保留一年——`report` 长区间（如 `-last 90d`）自动混读两层，进程切片不降采样（到期即删）。跨天自动 gzip，超期自动清理；启动时自动补压缩"没跨过午夜"的遗留 raw 并修复崩溃残留的半截 .gz。环形缓冲保内存最近约 2 小时（面板用）。同一数据目录只允许一个写实例（`reshmon.lock`，持有者退出后自动接管）。
 
 **健康阈值**（config.json 的 `thresholds` 字段可逐项覆盖，非零生效）：
 
@@ -144,6 +144,7 @@ reshmon.exe report -day 2026-10-25      # 指定某天
 | 提交内存 | ≥88% | ≥95% |
 | 磁盘忙碌 | ≥75% | ≥90% |
 | 磁盘延迟 | ≥20ms | ≥45ms |
+| 磁盘剩余空间 | ≤10% | ≤5% |
 | GPU 利用率 | ≥80% | ≥95% |
 | 显存占用 | ≥88% | ≥96% |
 
@@ -155,7 +156,7 @@ reshmon.exe report -day 2026-10-25      # 指定某天
 - **GPU 利用率**是各引擎（3D/Compute/Copy/VideoDecode…）之和，单进程可超 100（多引擎并行），显示时截断；核显（如 AMD 860M）"显存"为 BIOS 划分的专用份额（常 512MB），大头上共享系统内存——看"共享占用"。进程显存归因为专用+共享之和。**WARP（Microsoft Basic Render Driver，CPU 软件渲染回退）不计入 GPU 口径**——它的活是 CPU 干的，计入会凭空多出一张幻影卡片。
 - **Agent 内存**按私有提交（Private Bytes）求和，避免工作集把共享 DLL 重复计入。
 - **短命进程归因（ETW，需管理员）**：**IO** 走内核 DiskIO 事件精确配对——存活不足一个采样间隔的进程（编译/链接的一次性 IO）也进 Agent 账本；**CPU** 走 SampledProfile 采样做比例归因——每拍「总 CPU% − Σ已差分进程」的缺口按采样占比分配给短命/首拍/受保护进程（统计估计值、免校准，Agent 账本之和收敛到总量；DPC/ISR 等无样本残余不硬摊）。死者的整段账目记在退出后那一拍（速率偏高、总量正确）。非管理员自动降级并在 errors 明示；`etwIO`/`etwCPU` 可分别关闭。
-- **磁盘忙碌** = 100 − %Idle Time；受保护进程的明细需管理员权限（IO 明细在管理员下由 ETW 补齐）。
+- **磁盘忙碌** = 100 − %Idle Time；**磁盘剩余空间**按卷用 GetDiskFreeSpaceExW 直取（% Free Space 计数器的 RAW 值语义跨版本漂移，弃用），物理盘卡片显示其最差卷；受保护进程的明细需管理员权限（IO 明细在管理员下由 ETW 补齐）。
 - **网络总量**剔除虚拟适配器（Hyper-V vNIC/WSL/TAP 等）——同一流量会同时过 vNIC 与 pNIC 两个实例，全量求和会翻倍；明细表仍展示全部网卡。
 - 每核负载只在 `live` 面板显示为 ▮ 色条。
 

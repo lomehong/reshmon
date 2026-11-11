@@ -35,10 +35,15 @@ func toolSnapshot(src Source, args json.RawMessage) (any, error) {
 		out["reasons"] = rep.Reasons
 	}
 	for _, d := range snap.Disks {
-		out["disks"].(map[string]any)[d.Letters] = map[string]any{
+		entry := map[string]any{
 			"busyPct": round1(d.BusyPct), "readBps": uint64(d.ReadBps), "writeBps": uint64(d.WriteBps),
 			"latencyMs": round1((d.ReadLatMs + d.WriteLatMs) / 2),
 		}
+		if d.FreePct >= 0 {
+			entry["freePct"] = round1(d.FreePct)
+			entry["freeBytes"] = d.FreeB
+		}
+		out["disks"].(map[string]any)[d.Letters] = entry
 	}
 	for _, g := range snap.GPUs {
 		key := g.StableKey

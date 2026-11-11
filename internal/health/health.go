@@ -21,10 +21,13 @@ type Thresholds struct {
 	DiskBusySaturated  float64 `json:"diskBusySaturated"`
 	DiskLatDegradedMs  float64 `json:"diskLatDegradedMs"`
 	DiskLatSaturatedMs float64 `json:"diskLatSaturatedMs"`
-	GPUUtilDegraded    float64 `json:"gpuUtilDegraded"`
-	GPUUtilSaturated   float64 `json:"gpuUtilSaturated"`
-	VRAMDegraded       float64 `json:"vramDegraded"`
-	VRAMSaturated      float64 `json:"vramSaturated"`
+	// 磁盘剩余空间%（低向好）：小于等于阈值触发。
+	DiskFreeWarnPct  float64 `json:"diskFreeWarnPct"`
+	DiskFreeSatPct   float64 `json:"diskFreeSatPct"`
+	GPUUtilDegraded  float64 `json:"gpuUtilDegraded"`
+	GPUUtilSaturated float64 `json:"gpuUtilSaturated"`
+	VRAMDegraded     float64 `json:"vramDegraded"`
+	VRAMSaturated    float64 `json:"vramSaturated"`
 }
 
 func DefaultThresholds() Thresholds {
@@ -39,6 +42,8 @@ func DefaultThresholds() Thresholds {
 		DiskBusySaturated:  90,
 		DiskLatDegradedMs:  20,
 		DiskLatSaturatedMs: 45,
+		DiskFreeWarnPct:    10,
+		DiskFreeSatPct:     5,
 		GPUUtilDegraded:    80,
 		GPUUtilSaturated:   95,
 		VRAMDegraded:       88,
@@ -128,6 +133,30 @@ func (j *Judge) classify(key string, v, de, sat float64) string {
 	return cur
 }
 
+// classifyLow 低向好维度（剩余空间）：v ≤ 阈值触发；降档（回升）需
+// 越过 阈值+滞回带，与高向好 classify 镜像对称。
+func (j *Judge) classifyLow(key string, v, warnBelow, satBelow float64) string {
+	cur := model.StatusOK
+	switch {
+	case v <= satBelow:
+		cur = model.StatusSat
+	case v <= warnBelow:
+		cur = model.StatusWarn
+	}
+	switch j.last[key] {
+	case model.StatusSat:
+		if cur == model.StatusWarn && v <= satBelow+hysteresis {
+			cur = model.StatusSat
+		}
+	case model.StatusWarn:
+		if cur == model.StatusOK && v <= warnBelow+hysteresis {
+			cur = model.StatusWarn
+		}
+	}
+	j.last[key] = cur
+	return cur
+}
+
 // Evaluate 对最近 window 个 Totals 求均值后逐维判定。
 func (j *Judge) Evaluate(recs []model.Totals) Report {
 	var rep Report
@@ -163,9 +192,9 @@ func (j *Judge) Evaluate(recs []model.Totals) Report {
 	// 磁盘：按物理盘身份键聚合均值；均值分母用该盘实际出现的次数——
 	// 实例缺席的 tick 不摊薄（拔插盘/实例名重建不导致持续打满的盘漏报）。
 	type dacc struct {
-		busy, lat float64
-		n         int
-		label     string
+		busy, lat, free float64
+		n, freeN        int
+		label           string
 	}
 	disks := map[string]*dacc{}
 	for _, r := range recs {
@@ -179,16 +208,26 @@ func (j *Judge) Evaluate(recs []model.Totals) Report {
 			a.busy += d.Busy
 			a.lat += d.LatMs
 			a.n++
+			if d.FreePct >= 0 {
+				a.free += d.FreePct
+				a.freeN++
+			}
 		}
 	}
 	for id, a := range disks {
 		a.busy, a.lat = a.busy/float64(a.n), a.lat/float64(a.n)
 		st := worse(j.classify("disk:"+id+":busy", a.busy, j.Th.DiskBusyDegraded, j.Th.DiskBusySaturated),
 			j.classify("disk:"+id+":lat", a.lat, j.Th.DiskLatDegradedMs, j.Th.DiskLatSaturatedMs))
+		detail := fmt.Sprintf("忙 %.0f%%，读写延迟 %.1fms", a.busy, a.lat)
+		if a.freeN > 0 { // 剩余空间并入同一维度（低向好，同样带滞回）
+			a.free /= float64(a.freeN)
+			st = worse(st, j.classifyLow("disk:"+id+":free", a.free, j.Th.DiskFreeWarnPct, j.Th.DiskFreeSatPct))
+			detail += fmt.Sprintf("，剩余 %.1f%%", a.free)
+		}
 		add(DimStatus{
 			Key: "disk:" + id, Label: "磁盘 " + pickLabel(id, a.label),
 			Status: st, Value: a.busy, Unit: "%",
-			Detail: fmt.Sprintf("忙 %.0f%%，读写延迟 %.1fms", a.busy, a.lat),
+			Detail: detail,
 		})
 	}
 

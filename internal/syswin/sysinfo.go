@@ -116,6 +116,21 @@ func PidAlive(pid uint32) bool {
 	return code == 259 // STILL_ACTIVE
 }
 
+// DiskSpace 卷的容量与剩余字节（letter 形如 "C:"）。GetDiskFreeSpaceExW
+// 是磁盘空间的最权威口径——% Free Space 计数器的 RAW 值语义跨版本漂移
+// （实测返回的是剩余 MB 加性值而非百分比），弃用。
+func DiskSpace(letter string) (total, free uint64, err error) {
+	p, err := windows.UTF16PtrFromString(letter + `\`)
+	if err != nil {
+		return 0, 0, err
+	}
+	var avail uint64
+	if err = windows.GetDiskFreeSpaceEx(p, &avail, &total, &free); err != nil {
+		return 0, 0, err
+	}
+	return total, free, nil
+}
+
 // SetupConsole 让终端输出 UTF-8 并启用 ANSI 转义（VT）支持。
 func SetupConsole() {
 	_ = windows.SetConsoleOutputCP(65001)

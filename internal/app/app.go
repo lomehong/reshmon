@@ -347,7 +347,8 @@ func TotalsFrom(s *model.Snapshot) model.Totals {
 		t.Disks = append(t.Disks, model.DiskTotal{
 			ID: d.ID, L: d.Letters, Busy: d.BusyPct,
 			RBps: d.ReadBps, WBps: d.WriteBps,
-			LatMs: (d.ReadLatMs + d.WriteLatMs) / 2,
+			LatMs:   (d.ReadLatMs + d.WriteLatMs) / 2,
+			FreePct: d.FreePct,
 		})
 	}
 	for _, g := range s.GPUs {

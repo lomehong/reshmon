@@ -138,7 +138,7 @@ function renderCards(){
   cards.push({k:"memp",st:hs.mem,name:"内存",val:pct(m.physUsedPct),sub:fmtB(m.physTotalB)+" 物理 · 可用 "+fmtB(m.physAvailB),v:m.physUsedPct});
   cards.push({k:"commit",st:hs.commit,name:"提交内存",val:pct(m.commitPct),sub:fmtB(m.commitTotalB)+" / "+fmtB(m.commitLimitB),v:m.commitPct});
   (SNAP.disks||[]).forEach(d=>{const dk=(d.id||"").split(" ")[0]||d.id;cards.push({k:"disk:"+dk,st:hs["disk:"+dk],name:"磁盘 "+(d.l||d.id),val:pct(d.busy),
-    sub:"读 "+fmtB(d.rb)+"/s · 写 "+fmtB(d.wb)+"/s · "+(d.rms+d.wms).toFixed(1)+"ms",v:d.busy})});
+    sub:"读 "+fmtB(d.rb)+"/s · 写 "+fmtB(d.wb)+"/s · "+(d.rms+d.wms).toFixed(1)+"ms"+(d.free>=0?" · 剩 "+d.free.toFixed(1)+"%":""),v:d.busy})});
   (SNAP.gpus||[]).forEach(g=>{const gk=g.sk||g.luid;cards.push({k:"gpu:"+gk,st:hs["gpu:"+gk],name:"GPU "+g.name,val:pct(g.utilCapPct),
     sub:g.dedTotalB?("显存 "+fmtB(g.dedUsedB)+" / "+fmtB(g.dedTotalB)):"共享 "+fmtB(g.shUsedB),v:g.utilCapPct})});
   box.innerHTML=cards.map((c,i)=>`<div class="card ${stCls[c.st]||"ok"}">

@@ -14,7 +14,7 @@ import (
 )
 
 // Version 工具版本（唯一出处，CLI 与面板共用）。
-const Version = "0.5.1"
+const Version = "0.6.0"
 
 // 时长基准（窗口/频率以时间为源，间隔改变时承诺不漂移）：
 const (
@@ -184,6 +184,8 @@ func mergeThresholds(def, over health.Thresholds) health.Thresholds {
 	set(&def.DiskBusySaturated, over.DiskBusySaturated)
 	set(&def.DiskLatDegradedMs, over.DiskLatDegradedMs)
 	set(&def.DiskLatSaturatedMs, over.DiskLatSaturatedMs)
+	set(&def.DiskFreeWarnPct, over.DiskFreeWarnPct)
+	set(&def.DiskFreeSatPct, over.DiskFreeSatPct)
 	set(&def.GPUUtilDegraded, over.GPUUtilDegraded)
 	set(&def.GPUUtilSaturated, over.GPUUtilSaturated)
 	set(&def.VRAMDegraded, over.VRAMDegraded)

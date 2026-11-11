@@ -71,6 +71,8 @@ type DiskStat struct {
 	WriteLatMs float64 `json:"wms"`
 	ReadsPs    float64 `json:"rps"`
 	WritesPs   float64 `json:"wps"`
+	FreePct    float64 `json:"free"`  // 剩余空间%（该盘各卷最差值）；不可得为 -1
+	FreeB      uint64  `json:"freeb"` // 剩余字节（最差卷）；0=未知
 }
 
 type GPUStat struct {
@@ -135,12 +137,13 @@ type Totals struct {
 }
 
 type DiskTotal struct {
-	ID    string  `json:"id"`
-	L     string  `json:"l"`
-	Busy  float64 `json:"busy"`
-	RBps  float64 `json:"rb"`
-	WBps  float64 `json:"wb"`
-	LatMs float64 `json:"lat"` // 读写延迟均值
+	ID      string  `json:"id"`
+	L       string  `json:"l"`
+	Busy    float64 `json:"busy"`
+	RBps    float64 `json:"rb"`
+	WBps    float64 `json:"wb"`
+	LatMs   float64 `json:"lat"` // 读写延迟均值
+	FreePct float64 `json:"fp"`  // 剩余空间%均值（最差卷）；-1=不可得
 }
 
 type GPUTotal struct {

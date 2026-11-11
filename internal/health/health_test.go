@@ -1,6 +1,7 @@
 package health
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/lomehong/reshmon/internal/model"
@@ -178,6 +179,80 @@ func TestDiskKeyStable(t *testing.T) {
 		t.Fatalf("同一物理盘被拆成 %d 个维度", count)
 	}
 }
+
+// 磁盘剩余空间维度：低向好 ≤10% warn、≤5% sat；-1（不可得）不影响。
+func TestDiskFreeDim(t *testing.T) {
+	j := NewJudge(DefaultThresholds(), 2)
+	mk := func(fp float64) model.Totals {
+		return model.Totals{Disks: []model.DiskTotal{{ID: "0 C:", L: "C:", Busy: 2, FreePct: fp}}}
+	}
+	rep := j.Evaluate([]model.Totals{mk(8), mk(8)}) // 8% → 亚健康
+	found := false
+	for _, d := range rep.Dims {
+		if d.Key == "disk:0" {
+			found = true
+			if d.Status != model.StatusWarn {
+				t.Fatalf("8%% 剩余应亚健康: %+v", d)
+			}
+			if !strings.Contains(d.Detail, "剩余") {
+				t.Fatalf("detail 应含剩余: %s", d.Detail)
+			}
+		}
+	}
+	if !found || rep.Overall != model.StatusWarn {
+		t.Fatalf("磁盘剩余维度缺失或整体错误: %+v", rep)
+	}
+	// 4% → 饱和
+	rep2 := NewJudge(DefaultThresholds(), 1).Evaluate([]model.Totals{mk(4)})
+	if rep2.Overall != model.StatusSat {
+		t.Fatalf("4%% 剩余应饱和: %s", rep2.Overall)
+	}
+	// 不可得（-1）不影响忙/延迟结论
+	rep3 := NewJudge(DefaultThresholds(), 1).Evaluate([]model.Totals{mk(-1)})
+	if rep3.Overall != model.StatusOK || !strings.Contains(rep3.Dims[3].Detail, "忙") {
+		t.Fatalf("不可得应忽略且 detail 不含剩余: %+v", rep3.Dims[3])
+	}
+}
+
+// 剩余空间的滞回（镜像方向）：回升未越过 阈值+3 时保持原档。
+func TestDiskFreeHysteresis(t *testing.T) {
+	j := NewJudge(DefaultThresholds(), 1)
+	mk := func(fp float64) model.Totals {
+		return model.Totals{Disks: []model.DiskTotal{{ID: "0 C:", L: "C:", Busy: 2, FreePct: fp}}}
+	}
+	ev := func(fp float64) string {
+		rep := j.Evaluate([]model.Totals{mk(fp)})
+		return rep.Dims[3].Status
+	}
+	if got := ev(8); got != model.StatusWarn {
+		t.Fatalf("8%% 应 warn: %s", got)
+	}
+	if got := ev(12); got != model.StatusWarn { // 12 < 10+3：滞回带内保持
+		t.Fatalf("12%% 应保持 warn（滞回）: %s", got)
+	}
+	if got := ev(14); got != model.StatusOK {
+		t.Fatalf("14%% 越过滞回带应恢复 ok: %s", got)
+	}
+}
+
+// 带滞回的classify（高向好）在 Evaluate 的整体链路中生效：升档立即、
+// 降档需跌破阈值-3。
+func TestHysteresisInEvaluate(t *testing.T) {
+	j := NewJudge(DefaultThresholds(), 1)
+	mk := func(cpu float64) model.Totals { return mk2(cpu) }
+	rep := j.Evaluate([]model.Totals{mk(66)})
+	if rep.Overall != model.StatusWarn {
+		t.Fatalf("66 应 warn: %s", rep.Overall)
+	}
+	if rep := j.Evaluate([]model.Totals{mk(63)}); rep.Overall != model.StatusWarn {
+		t.Fatalf("63（滞回带内）应保持 warn: %s", rep.Overall)
+	}
+	if rep := j.Evaluate([]model.Totals{mk(61)}); rep.Overall != model.StatusOK {
+		t.Fatalf("61 应恢复 ok: %s", rep.Overall)
+	}
+}
+
+func mk2(cpu float64) model.Totals { return model.Totals{CPU: cpu, MemUsedPct: 30, CommitPct: 30} }
 
 // 采集降级不能伪装成健康：Overall 至少 warn 且原因入列。
 func TestApplyDegrade(t *testing.T) {

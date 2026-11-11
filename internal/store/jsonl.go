@@ -230,7 +230,14 @@ func (w *Writer) repairDir(now time.Time) {
 	}
 }
 
+// MinRetentionDays 分钟级降采样层（totals-min-*）的保留天数。
+// 原始层（2s 粒度）过 RetentionDays 后降采样为分钟级均值再保留一年——
+// 长区间趋势分析（如内存/提交的数月爬坡）因此可用，体积约为原始的 1/30。
+const MinRetentionDays = 365
+
 // prune 删除超过保留天数的 totals-*/procs-* 文件（含 .gz）。
+// totals 在删除前降采样为分钟级 min 文件（幂等：已存在则跳过；
+// 写入为临时文件+原子改名，崩溃不会留下半截 min 文件）。
 func (w *Writer) prune() {
 	if w.retention <= 0 {
 		return
@@ -241,10 +248,191 @@ func (w *Writer) prune() {
 	}
 	cutoff := dayKey(w.nowFn().AddDate(0, 0, -w.retention))
 	for _, e := range entries {
-		if day, ok := fileDay(e.Name()); ok && day < cutoff {
-			_ = os.Remove(filepath.Join(w.dir, e.Name()))
+		day, ok := fileDay(e.Name())
+		if !ok || day >= cutoff {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), "totals-") {
+			if err := downsampleDay(w.dir, day); err != nil {
+				// 降采样失败不删除原始文件，明天 prune 重试
+				continue
+			}
+		}
+		_ = os.Remove(filepath.Join(w.dir, e.Name()))
+	}
+}
+
+// minDayOf 从 min 文件名解析日期：totals-min-YYYYMMDD.jsonl.gz。
+func minDayOf(name string) (string, bool) {
+	const prefix = "totals-min-"
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".jsonl.gz") {
+		return "", false
+	}
+	day := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".jsonl.gz")
+	if len(day) != 8 {
+		return "", false
+	}
+	if _, err := strconv.Atoi(day); err != nil {
+		return "", false
+	}
+	return day, true
+}
+
+// downsampleDay 把某天的 totals 降采样为分钟级均值，写入
+// totals-min-<day>.jsonl.gz（已存在则幂等跳过）。procs 切片不降采样
+// （体积大、长区间无意义），随原始文件一起到期删除。
+func downsampleDay(dir, day string) error {
+	target := filepath.Join(dir, "totals-min-"+day+".jsonl.gz")
+	if _, err := os.Stat(target); err == nil {
+		return nil
+	}
+	dayStart, _ := time.ParseInLocation("20060102", day, time.Local)
+	dayEnd := dayStart.Add(24 * time.Hour)
+	recs, _, err := LoadTotals(dir, dayStart, dayEnd)
+	if err != nil {
+		return err
+	}
+	if len(recs) == 0 {
+		return nil
+	}
+	// 按分钟桶求均值（数字字段），标签取首见；GPU 的 Key 必须透传
+	// （report/趋势按 Key 分组，置空会全部塌缩成一条）
+	type acc struct {
+		n                 int
+		cpu, memp, commit float64
+		nr, ns            float64
+		disks             map[string]*struct {
+			id, l                 string
+			busy, rb, wb, lat, fp float64
+		}
+		gpus map[string]*struct {
+			key, name  string
+			util, vram float64
+		}
+		agents map[string]*model.AgentStat
+	}
+	buckets := map[int64]*acc{}
+	order := []int64{}
+	for _, r := range recs {
+		b := r.T / 60000 * 60000
+		a := buckets[b]
+		if a == nil {
+			a = &acc{disks: map[string]*struct {
+				id, l                 string
+				busy, rb, wb, lat, fp float64
+			}{}, gpus: map[string]*struct {
+				key, name  string
+				util, vram float64
+			}{}, agents: map[string]*model.AgentStat{}}
+			buckets[b] = a
+			order = append(order, b)
+		}
+		a.n++
+		a.cpu += r.CPU
+		a.memp += r.MemUsedPct
+		a.commit += r.CommitPct
+		a.nr += r.NetRecvBps
+		a.ns += r.NetSentBps
+		for _, d := range r.Disks {
+			da := a.disks[d.ID]
+			if da == nil {
+				da = &struct {
+					id, l                 string
+					busy, rb, wb, lat, fp float64
+				}{id: d.ID, l: d.L}
+				a.disks[d.ID] = da
+			}
+			da.busy += d.Busy
+			da.rb += d.RBps
+			da.wb += d.WBps
+			da.lat += d.LatMs
+			da.fp += d.FreePct
+		}
+		for _, g := range r.GPUs {
+			ga := a.gpus[g.Key]
+			if ga == nil {
+				ga = &struct {
+					key, name  string
+					util, vram float64
+				}{key: g.Key, name: g.Name}
+				a.gpus[g.Key] = ga
+			}
+			ga.util += g.Util
+			ga.vram += g.VramPct
+		}
+		for _, ag := range r.Agents {
+			aa := a.agents[ag.Name]
+			if aa == nil {
+				c := ag
+				aa = &c
+				a.agents[ag.Name] = aa
+				continue
+			}
+			aa.CpuPct += ag.CpuPct
+			aa.MemPrivB += ag.MemPrivB
+			aa.ReadBps += ag.ReadBps
+			aa.WriteBps += ag.WriteBps
+			aa.GpuPct += ag.GpuPct
+			aa.VramB += ag.VramB
+			aa.Procs += ag.Procs
 		}
 	}
+	sort.Slice(order, func(i, j int) bool { return order[i] < order[j] })
+	var buf bytes.Buffer
+	for _, b := range order {
+		a := buckets[b]
+		n := float64(a.n)
+		out := model.Totals{
+			T: b, CPU: a.cpu / n, MemUsedPct: a.memp / n, CommitPct: a.commit / n,
+			NetRecvBps: a.nr / n, NetSentBps: a.ns / n,
+		}
+		for _, da := range a.disks {
+			out.Disks = append(out.Disks, model.DiskTotal{
+				ID: da.id, L: da.l, Busy: da.busy / n, RBps: da.rb / n, WBps: da.wb / n,
+				LatMs: da.lat / n, FreePct: da.fp / n,
+			})
+		}
+		for _, ga := range a.gpus {
+			out.GPUs = append(out.GPUs, model.GPUTotal{Key: ga.key, Name: ga.name, Util: ga.util / n, VramPct: ga.vram / n})
+		}
+		for _, aa := range a.agents {
+			c := *aa
+			c.CpuPct /= n
+			c.ReadBps /= n
+			c.WriteBps /= n
+			c.GpuPct /= n
+			c.Procs = int(float64(c.Procs)/n + 0.5)
+			out.Agents = append(out.Agents, c)
+		}
+		line, merr := json.Marshal(out)
+		if merr != nil {
+			continue
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	// 压缩到临时文件后原子改名：崩溃不留半截 min 文件
+	tmp := target + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	zw := gzip.NewWriter(f)
+	if _, err = zw.Write(buf.Bytes()); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err = zw.Close(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err = f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, target)
 }
 
 // fileDay 从文件名解析日期（totals-20260102.jsonl / .jsonl.gz 均可）。
@@ -303,7 +491,9 @@ func readJSONL[T any](path string) ([]T, error) {
 
 // LoadTotals 读取 [from,to] 的总量记录（.jsonl 与 .jsonl.gz 合并，按时间升序）。
 // 逐条按时间窗过滤；raw 与 gz 并存时以 raw 为准；单文件损坏（如 gzip
-// 截断）跳过并记入 warnings，不让整天查询失败。
+// 截断）跳过并记入 warnings，不让整天查询失败。已过期降采样的日子，
+// 原始层缺失时自动读分钟级 totals-min-*（同一日原始层仍存在时跳过
+// min 层防重复）。
 func LoadTotals(dir string, from, to time.Time) ([]model.Totals, []string, error) {
 	var out []model.Totals
 	var warns []string
@@ -315,6 +505,7 @@ func LoadTotals(dir string, from, to time.Time) ([]model.Totals, []string, error
 			}
 		}
 	}
+	covered := map[string]bool{} // 已有原始数据的日期（min 层跳过）
 	for d := truncateDay(from); !d.After(truncateDay(to)); d = d.AddDate(0, 0, 1) {
 		day := dayKey(d)
 		recs, err := readJSONL[model.Totals](totalsPath(dir, day))
@@ -323,6 +514,7 @@ func LoadTotals(dir string, from, to time.Time) ([]model.Totals, []string, error
 			recs = nil
 		}
 		if len(recs) > 0 {
+			covered[day] = true
 			appendFiltered(recs)
 			continue
 		}
@@ -331,7 +523,30 @@ func LoadTotals(dir string, from, to time.Time) ([]model.Totals, []string, error
 			warns = append(warns, fmt.Sprintf("totals-%s.gz 读取失败（已跳过）: %v", day, err))
 			continue
 		}
-		appendFiltered(gzRecs)
+		if len(gzRecs) > 0 {
+			covered[day] = true
+			appendFiltered(gzRecs)
+			continue
+		}
+	}
+	// 分钟级降采样层：日期入窗且该日无原始数据
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		day, ok := minDayOf(e.Name())
+		if !ok || covered[day] {
+			continue
+		}
+		d, perr := time.ParseInLocation("20060102", day, time.Local)
+		if perr != nil || d.Before(truncateDay(from)) || d.After(truncateDay(to)) {
+			continue
+		}
+		minRecs, err := readJSONL[model.Totals](filepath.Join(dir, e.Name()))
+		if err != nil {
+			warns = append(warns, fmt.Sprintf("%s 读取失败（已跳过）: %v", e.Name(), err))
+			continue
+		}
+		covered[day] = true
+		appendFiltered(minRecs)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].T < out[j].T })
 	return out, warns, nil

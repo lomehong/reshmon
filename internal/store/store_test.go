@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -356,6 +357,117 @@ func TestAppendAfterCloseErrors(t *testing.T) {
 	if err := w.AppendProcs(time.Now(), nil); err == nil {
 		t.Fatal("关闭后 AppendProcs 应报错")
 	}
+}
+
+// 回归：过期日降采样为分钟级 min 文件（幂等、原子改名、混读去重）。
+func TestDownsampleOnPrune(t *testing.T) {
+	dir := t.TempDir()
+	day := time.Date(2026, 6, 1, 10, 0, 0, 0, time.Local)
+	w, err := newWriterClock(dir, 1, 14, func() time.Time { return day })
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 3 个分钟桶、每桶 2 条（10/20 → 15；30/40 → 35；50/60 → 55）
+	vals := []float64{10, 20, 30, 40, 50, 60}
+	for i, v := range vals {
+		ts := day.Add(time.Duration(i/2) * time.Minute).Add(time.Duration(i%2) * 30 * time.Second)
+		if err := w.Append(model.Totals{T: ts.UnixMilli(), CPU: v, MemUsedPct: 50}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.AppendProcs(day.Add(time.Minute), []model.ProcStat{{PID: 1, Name: "x.exe"}}); err != nil {
+		t.Fatal(err)
+	}
+	// 跨过保留期：触发轮转 + prune → 降采样 + 删除
+	later := day.AddDate(0, 0, 15)
+	w.SetNow(func() time.Time { return later })
+	if err := w.Append(model.Totals{T: later.UnixMilli(), CPU: 5}); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+
+	minPath := filepath.Join(dir, "totals-min-20260601.jsonl.gz")
+	if _, err := os.Stat(minPath); err != nil {
+		t.Fatalf("min 文件未生成: %v", err)
+	}
+	if _, err := os.Stat(totalsPath(dir, "20260601")); !os.IsNotExist(err) {
+		t.Fatal("过期 raw 应被删除")
+	}
+	// 幂等：再跑一次 prune 不重复写入
+	w2, err := newWriterClock(dir, 1, 14, func() time.Time { return later })
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2.Close()
+
+	// 混读：原始层缺失 → 自动读 min 层，分钟均值正确
+	recs, _, err := LoadTotals(dir, day, day.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 3 || recs[0].CPU != 15 || recs[1].CPU != 35 || recs[2].CPU != 55 {
+		t.Fatalf("分钟均值错误: %+v", recs)
+	}
+	if recs[0].T != day.UnixMilli() { // day 本身即 10:00 整分，首桶对齐
+		t.Fatalf("桶时刻应取整分钟: %d want %d", recs[0].T, day.UnixMilli())
+	}
+	// 重复读取不过量（min 幂等 + 无重复）
+	recs2, _, _ := LoadTotals(dir, day, day.Add(24*time.Hour))
+	if len(recs2) != 3 {
+		t.Fatalf("重复读取数量不稳定: %d", len(recs2))
+	}
+	// procs 切片不降采样：过期即删
+	if _, err := os.Stat(procsPath(dir, "20260601")); !os.IsNotExist(err) {
+		t.Fatal("过期 procs 应被删除")
+	}
+}
+
+// 崩溃窗口去重：min 已写、raw 未删时，LoadTotals 只取 raw 不重复。
+func TestLoadTotalsMinDedupe(t *testing.T) {
+	dir := t.TempDir()
+	day := time.Date(2026, 6, 1, 10, 0, 0, 0, time.Local)
+	// raw 在（t 用当日内真实时刻，别拍脑袋的 epoch）
+	if err := os.WriteFile(totalsPath(dir, "20260601"),
+		[]byte(fmt.Sprintf(`{"t":%d,"cpu":10}`+"\n", day.Add(time.Hour).UnixMilli())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// min 也在（崩溃窗口）
+	recs := []model.Totals{{T: day.Add(time.Hour).UnixMilli(), CPU: 99}}
+	if err := writeMinFile(dir, "20260601", recs); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := LoadTotals(dir, day, day.Add(24*time.Hour))
+	if err != nil || len(got) != 1 || got[0].CPU != 10 {
+		t.Fatalf("raw 存在时不得读 min 层: %+v %v", got, err)
+	}
+	// 删 raw → 读 min
+	os.Remove(totalsPath(dir, "20260601"))
+	got, _, err = LoadTotals(dir, day, day.Add(24*time.Hour))
+	if err != nil || len(got) != 1 || got[0].CPU != 99 {
+		t.Fatalf("raw 缺失时应读 min 层: %+v %v", got, err)
+	}
+}
+
+func writeMinFile(dir, day string, recs []model.Totals) error {
+	var buf bytes.Buffer
+	for _, r := range recs {
+		b, _ := json.Marshal(r)
+		buf.Write(b)
+		buf.WriteByte('\n')
+	}
+	f, err := os.Create(filepath.Join(dir, "totals-min-"+day+".jsonl.gz"))
+	if err != nil {
+		return err
+	}
+	zw := gzip.NewWriter(f)
+	_, werr := zw.Write(buf.Bytes())
+	if cerr := zw.Close(); werr == nil {
+		werr = cerr
+	}
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	return werr
 }
 
 func gzipBytes(b []byte) []byte {

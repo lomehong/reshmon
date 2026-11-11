@@ -32,6 +32,8 @@ var diskPaths = map[string]string{
 	"wms":  `\PhysicalDisk(*)\Avg. Disk sec/Write`,
 	"rps":  `\PhysicalDisk(*)\Disk Reads/sec`,
 	"wps":  `\PhysicalDisk(*)\Disk Writes/sec`,
+	// 剩余空间不走 PDH：% Free Space 的 RAW 值语义跨版本漂移（实测是
+	// 剩余 MB 的加性值而非百分比）。用 GetDiskFreeSpaceExW 按卷直取。
 }
 
 var gpuProcMemPaths = map[string]string{
@@ -339,6 +341,7 @@ func (s *Sampler) readDisks(snap *model.Snapshot, cur map[string]rawSet) {
 	pair("wps", func(a *diskAgg, v float64) { a.wps = max0(v) })
 
 	for id, a := range ags {
+		freePct, freeB := s.freeOfLetters(lettersOf(id))
 		snap.Disks = append(snap.Disks, model.DiskStat{
 			ID:         id,
 			Letters:    lettersOf(id),
@@ -350,9 +353,32 @@ func (s *Sampler) readDisks(snap *model.Snapshot, cur map[string]rawSet) {
 			WriteLatMs: a.wms,
 			ReadsPs:    a.rps,
 			WritesPs:   a.wps,
+			FreePct:    freePct,
+			FreeB:      freeB,
 		})
 	}
 	sort.Slice(snap.Disks, func(i, j int) bool { return snap.Disks[i].ID < snap.Disks[j].ID })
+}
+
+// freeOfLetters 该物理盘上各逻辑卷的剩余空间，取最差（最低%）卷。
+// GetDiskFreeSpaceExW 直取（% Free Space 计数器 RAW 语义漂移，弃用）。
+// 全部卷不可得时返回 (-1, 0)。
+func (s *Sampler) freeOfLetters(letters string) (float64, uint64) {
+	worstPct, worstB := -1.0, uint64(0)
+	for _, letter := range strings.Fields(letters) {
+		total, free, err := syswin.DiskSpace(letter)
+		if err != nil || total == 0 {
+			continue
+		}
+		pct := float64(free) / float64(total) * 100
+		if worstPct < 0 || pct < worstPct {
+			worstPct, worstB = pct, free
+		}
+	}
+	if worstPct < 0 {
+		return -1, 0
+	}
+	return worstPct, worstB
 }
 
 // timerOrRaw 按计数器键选差分口径：q 为瞬时值，rms/wms 为均次毫秒
