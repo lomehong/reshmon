@@ -28,6 +28,7 @@ import (
 	"github.com/lomehong/reshmon/internal/report"
 	"github.com/lomehong/reshmon/internal/sampler"
 	"github.com/lomehong/reshmon/internal/service"
+	"github.com/lomehong/reshmon/internal/store"
 	"github.com/lomehong/reshmon/internal/syswin"
 	"github.com/lomehong/reshmon/internal/tui"
 	"github.com/lomehong/reshmon/internal/webui"
@@ -60,6 +61,8 @@ func main() {
 		err = cmdService(os.Args[2:])
 	case "mcp":
 		err = cmdMCP(os.Args[2:])
+	case "recover":
+		err = cmdRecover(os.Args[2:])
 	case "report":
 		err = cmdReport(os.Args[2:])
 	case "help", "-h", "--help":
@@ -84,6 +87,7 @@ func usage() {
   reshmon serve   [-addr 127.0.0.1:8964] [-data 目录] [-no-record] [-interval 1s]   Web 面板（默认同时记录历史）
   reshmon service [-addr …] [-data …] install|remove|start|stop|status   Windows 服务（自启/崩溃自动恢复）
   reshmon mcp     [-data 目录]   MCP 服务器（stdio）——让 Agent 自查资源后决策并发
+  reshmon recover [-day 2026-11-10 | -last 48h] [-data 目录]   从 totals 重建丢失的事件
   reshmon report  [-day 2026-10-26 | -last 24h]         回溯分析已记录的历史
   reshmon version
 
@@ -383,6 +387,53 @@ func cmdMCP(args []string) error {
 	}
 	defer a.Close()
 	return mcp.Serve(a, app.Version, os.Stdin, os.Stdout, os.Stderr)
+}
+
+// cmdRecover 从 totals 的逐拍健康状态图重建缺失的事件（v0.5.0 及更早
+// 的 incidents 静默失败事故后的数据恢复）。与正在运行的服务实例互不
+// 干扰（O_APPEND 追加原子）；恢复后重启服务（service stop/start），
+// 面板时间线即可看到补回的事件。
+func cmdRecover(args []string) error {
+	fs := flag.NewFlagSet("recover", flag.ExitOnError)
+	dataDir := fs.String("data", "", "数据目录")
+	day := fs.String("day", "", "恢复某天，如 2026-11-10")
+	last := fs.Duration("last", 7*24*time.Hour, "恢复最近时长（默认 7 天）")
+	_ = fs.Parse(args)
+
+	cfg, _ := app.LoadConfig(*dataDir)
+	now := time.Now()
+	var from, to time.Time
+	if *day != "" {
+		d, err := time.ParseInLocation("2006-01-02", *day, time.Local)
+		if err != nil {
+			return fmt.Errorf("-day 格式应为 2026-11-10: %w", err)
+		}
+		from, to = d, d.Add(24*time.Hour)
+		if to.After(now) {
+			to = now
+		}
+	} else {
+		from, to = now.Add(-*last), now
+	}
+	recs, err := store.RecoverIncidents(cfg.DataDir, from, to)
+	if err != nil {
+		return err
+	}
+	if len(recs) == 0 {
+		fmt.Println("该时段没有可恢复的缺失事件。")
+		return nil
+	}
+	l, err := store.OpenIncidentLog(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	defer l.Close()
+	for _, in := range recs {
+		l.Append(in)
+	}
+	fmt.Printf("已恢复 %d 条缺失事件（%s ~ %s）并写入 incidents.jsonl。\n重启服务（reshmon service stop && reshmon service start）后面板时间线可见。\n",
+		len(recs), from.Format("01-02 15:04"), to.Format("01-02 15:04"))
+	return nil
 }
 
 // cmdReport 离线回溯分析。

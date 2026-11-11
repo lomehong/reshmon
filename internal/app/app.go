@@ -197,8 +197,8 @@ func (a *App) step(baseline bool) {
 // 达此时长才落事件；期间回到原状态视为抖动脉冲直接丢弃，跳到第三档
 // 则立即确认原迁移并挂起新迁移。11-06 实测一天 78 条事件多为秒级往返
 // 脉冲，此机制把时间线还给真实持续的异常。事件时间戳仍是迁移首次
-// 观察时刻（防抖只延迟确认，不改时间）。
-const minDwellMs = 30_000
+// 观察时刻（防抖只延迟确认，不改时间）。语义常量归 store（重建端共用）。
+const minDwellMs = store.MinDwellMs
 
 // pendingInc 挂起中的迁移（仅 loop 协程触碰，无需锁）。
 type pendingInc struct {
