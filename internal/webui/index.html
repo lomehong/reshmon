@@ -44,6 +44,13 @@
   .mono{font-family:ui-monospace,Consolas,monospace}
   footer{color:var(--dim); font-size:11px; margin-top:6px; line-height:1.7}
   .empty{color:var(--dim); padding:8px 0}
+  /* 内容区限高滚动：页面不被长列表无限拉高 */
+  .card{max-height:170px;overflow:hidden}
+  .tbl-scroll{max-height:400px;overflow-y:auto}
+  .tbl-scroll thead th{position:sticky;top:0;background:var(--panel);z-index:1}
+  .inc-scroll{max-height:320px;overflow-y:auto}
+  .tbl-scroll::-webkit-scrollbar,.inc-scroll::-webkit-scrollbar{width:8px}
+  .tbl-scroll::-webkit-scrollbar-thumb,.inc-scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
   .cols{display:grid; grid-template-columns:1fr 1fr; gap:14px}
   @media(max-width:1100px){.cols{grid-template-columns:1fr}}
 </style>
@@ -66,23 +73,23 @@
 <div class="cols">
   <section>
     <h2>Agent / 系统桶（按 CPU 排序）</h2>
-    <table id="agents"><thead><tr>
+    <div class="tbl-scroll"><table id="agents"><thead><tr>
       <th>名称</th><th class="num">CPU%</th><th class="num">内存(私有)</th><th class="num">磁盘 读/写</th><th class="num">GPU%</th><th class="num">显存</th><th class="num">进程</th>
-    </tr></thead><tbody></tbody></table>
+    </tr></thead><tbody></tbody></table></div>
   </section>
   <section>
     <h2>进程 Top（点击列头排序）</h2>
-    <table id="procs"><thead><tr>
+    <div class="tbl-scroll"><table id="procs"><thead><tr>
       <th data-k="pid">PID</th><th data-k="n">进程</th><th data-k="a">归属</th>
       <th data-k="cpu" class="num">CPU%</th><th data-k="priv" class="num">内存</th>
       <th data-k="io" class="num">磁盘 读/写</th><th data-k="gpu" class="num">GPU%</th><th data-k="vram" class="num">显存</th>
-    </tr></thead><tbody></tbody></table>
+    </tr></thead><tbody></tbody></table></div>
   </section>
 </div>
 
 <section>
   <h2>健康事件（状态迁移，最近 7 天）</h2>
-  <div id="incidents"><div class="empty">暂无事件</div></div>
+  <div id="incidents" class="inc-scroll"><div class="empty">暂无事件</div></div>
 </section>
 
 <footer id="footer"></footer>
@@ -138,7 +145,7 @@ function renderCards(){
   cards.push({k:"memp",st:hs.mem,name:"内存",val:pct(m.physUsedPct),sub:fmtB(m.physTotalB)+" 物理 · 可用 "+fmtB(m.physAvailB),v:m.physUsedPct});
   cards.push({k:"commit",st:hs.commit,name:"提交内存",val:pct(m.commitPct),sub:fmtB(m.commitTotalB)+" / "+fmtB(m.commitLimitB),v:m.commitPct});
   (SNAP.disks||[]).forEach(d=>{const dk=(d.id||"").split(" ")[0]||d.id;cards.push({k:"disk:"+dk,st:hs["disk:"+dk],name:"磁盘 "+(d.l||d.id),val:pct(d.busy),
-    sub:"读 "+fmtB(d.rb)+"/s · 写 "+fmtB(d.wb)+"/s · "+(d.rms+d.wms).toFixed(1)+"ms"+(d.free>=0?" · 剩 "+d.free.toFixed(1)+"%":""),v:d.busy})});
+    sub:(d.free>=0?"剩 "+d.free.toFixed(1)+"% · ":"")+"读 "+fmtB(d.rb)+"/s · 写 "+fmtB(d.wb)+"/s · "+(d.rms+d.wms).toFixed(1)+"ms",v:d.busy})});
   (SNAP.gpus||[]).forEach(g=>{const gk=g.sk||g.luid;cards.push({k:"gpu:"+gk,st:hs["gpu:"+gk],name:"GPU "+g.name,val:pct(g.utilCapPct),
     sub:g.dedTotalB?("显存 "+fmtB(g.dedUsedB)+" / "+fmtB(g.dedTotalB)):"共享 "+fmtB(g.shUsedB),v:g.utilCapPct})});
   box.innerHTML=cards.map((c,i)=>`<div class="card ${stCls[c.st]||"ok"}">
