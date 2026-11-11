@@ -189,9 +189,13 @@ func (a *App) loop() {
 // stallIncident 采样管线冻结的自证事件：tick 间隔超过阈值即管线曾停摆
 // （磁盘卡死把阻塞写挂住是最常见的诱因）。恢复后的第一个成功 tick
 // 立刻记录冻结时长——「丢了多少」本身成为时间线上的一条事实。
+// 首拍（lastTick 为零值）不构成冻结。
 func stallIncident(lastTick, now time.Time) (store.Incident, bool) {
+	if lastTick.IsZero() {
+		return store.Incident{}, false
+	}
 	gap := now.Sub(lastTick)
-	if gap < store.RecorderStallMs {
+	if gap < store.RecorderStall {
 		return store.Incident{}, false
 	}
 	return store.Incident{

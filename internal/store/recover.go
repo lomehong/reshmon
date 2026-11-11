@@ -16,13 +16,15 @@ type recoverPending struct {
 // 同一语义，恢复出的事件与实时记录的口径一致。
 const MinDwellMs = 30_000
 
-// RecorderStallMs 记录器冻结判定阈值：相邻 tick 间隔超过它即视为一次
+// RecorderStall 记录器冻结判定阈值：相邻 tick 间隔超过它即视为一次
 // 采样管线停摆（磁盘卡死把阻塞写挂住/系统冻结/睡眠——无论哪种，时间
 // 线都必须诚实标注盲区，而不是让人误以为「当时一切正常」）。
-const RecorderStallMs = 60_000
+// 必须保持 time.Duration 类型（曾因无类型常量 60_000 被当作 60 微秒、
+// 每个 2s tick 都误判为冻结的单元事故）。
+const RecorderStall = 60 * time.Second
 
 // ScanGaps 扫描 [from,to] 的 totals 相邻 tick 间隔，返回超过
-// RecorderStallMs 的断档（起点时刻与时长毫秒）。
+// RecorderStall 的断档（起点时刻与时长毫秒）。
 func ScanGaps(dir string, from, to time.Time) (gaps []Incident, err error) {
 	recs, _, err := LoadTotals(dir, from, to)
 	if err != nil {
@@ -30,7 +32,7 @@ func ScanGaps(dir string, from, to time.Time) (gaps []Incident, err error) {
 	}
 	var prev int64
 	for _, r := range recs {
-		if prev > 0 && r.T-prev >= RecorderStallMs {
+		if prev > 0 && time.Duration(r.T-prev)*time.Millisecond >= RecorderStall {
 			gaps = append(gaps, Incident{
 				T:    prev,
 				Dim:  "recorder",

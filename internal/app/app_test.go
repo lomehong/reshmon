@@ -163,6 +163,25 @@ func TestIncidentDwellDebounce(t *testing.T) {
 	}
 }
 
+// 看门狗阈值单位回归（v0.6.2 曾因无类型常量 60_000 被当作 60 微秒、
+// 每 2s tick 都误判为冻结而刷屏）：首拍不触发、2s/30s 不触发、61s 触发。
+func TestStallIncidentThreshold(t *testing.T) {
+	now := time.Now()
+	if _, hit := stallIncident(time.Time{}, now); hit {
+		t.Fatal("首拍（零值）不构成冻结")
+	}
+	if _, hit := stallIncident(now.Add(-2*time.Second), now); hit {
+		t.Fatal("2s 正常间隔不得触发")
+	}
+	if _, hit := stallIncident(now.Add(-30*time.Second), now); hit {
+		t.Fatal("30s 正常间隔不得触发")
+	}
+	inc, hit := stallIncident(now.Add(-61*time.Second), now)
+	if !hit || inc.Dim != "recorder" || inc.From != "ok" || inc.To != "stalled" {
+		t.Fatalf("61s 冻结应触发: hit=%v inc=%+v", hit, inc)
+	}
+}
+
 func cpuDim(incs []store.Incident) []store.Incident {
 	var out []store.Incident
 	for _, in := range incs {
