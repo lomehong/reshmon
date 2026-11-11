@@ -80,6 +80,9 @@ func handler(a *app.App, allowedHosts map[string]bool) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
+		// 升级二进制后面板必须跟着换：禁止浏览器缓存旧版嵌入页面
+		// （实测过缓存旧 HTML 导致新功能不显示的反馈）。
+		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(indexHTML)
 	})

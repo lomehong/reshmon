@@ -54,6 +54,7 @@ type App struct {
 	errSeen    map[string]bool
 	prevStatus map[string]string
 	pending    map[string]pendingInc // 挂起中的状态迁移（防抖确认期）
+	lastTickAt time.Time             // 上一个成功 tick 的时刻（冻结看门狗）
 	tickN      int
 
 	stopCh chan struct{}
@@ -117,8 +118,37 @@ func Start(cfg Config) (*App, error) {
 			a.addErr("事件日志不可用：" + err.Error())
 		}
 	}
+	a.scanRecorderGaps()
 	go a.loop()
 	return a, nil
+}
+
+// scanRecorderGaps 启动时扫描最近 48h 的 totals 断档，把历史冻结补成
+// "recorder 冻结" 事件（按起点时刻去重）——数据缺失区间在时间线上
+// 诚实可见，而不是让人误以为冻结期间一切正常。
+func (a *App) scanRecorderGaps() {
+	from := time.Now().Add(-48 * time.Hour)
+	gaps, err := store.ScanGaps(a.Cfg.DataDir, from, time.Now())
+	if err != nil {
+		a.addErr("断档扫描失败：" + err.Error())
+		return
+	}
+	if len(gaps) == 0 {
+		return
+	}
+	existing := map[int64]bool{}
+	if incs, err := store.LoadIncidents(a.Cfg.DataDir, from, time.Now()); err == nil {
+		for _, in := range incs {
+			if in.Dim == "recorder" {
+				existing[in.T] = true
+			}
+		}
+	}
+	for _, g := range gaps {
+		if !existing[g.T] {
+			a.addIncident(g)
+		}
+	}
 }
 
 // loadIncidentBaseline 启动时回放已落盘事件：内存事件表续上历史（面板
@@ -156,11 +186,34 @@ func (a *App) loop() {
 	}
 }
 
+// stallIncident 采样管线冻结的自证事件：tick 间隔超过阈值即管线曾停摆
+// （磁盘卡死把阻塞写挂住是最常见的诱因）。恢复后的第一个成功 tick
+// 立刻记录冻结时长——「丢了多少」本身成为时间线上的一条事实。
+func stallIncident(lastTick, now time.Time) (store.Incident, bool) {
+	gap := now.Sub(lastTick)
+	if gap < store.RecorderStallMs {
+		return store.Incident{}, false
+	}
+	return store.Incident{
+		T:    lastTick.UnixMilli(),
+		Dim:  "recorder",
+		From: "ok",
+		To:   "stalled",
+		Detail: fmt.Sprintf("采样管线冻结 %.0f 分钟后自愈（%s 起数据缺失，冻结期间系统状态未被观测）",
+			gap.Minutes(), lastTick.Format("15:04:05")),
+	}, true
+}
+
 func (a *App) step(baseline bool) {
 	snap := a.s.Tick()
 	if baseline {
 		return
 	}
+	// 看门狗自证：距上一成功 tick 超过阈值 = 管线刚从冻结中恢复
+	if inc, hit := stallIncident(a.lastTickAt, snap.TS); hit {
+		a.addIncident(inc)
+	}
+	a.lastTickAt = snap.TS
 	totals := TotalsFrom(snap)
 
 	// 判定窗口 = 环形尾部 + 当前
@@ -241,19 +294,22 @@ func (a *App) recordTransitions(rep health.Report, snap *model.Snapshot) {
 		a.prevStatus[key] = st // 首次观察：建立基线，不产生事件
 	}
 	for _, inc := range confirmed {
-		// 内存事件始终记录（-no-record 时时间线才可用）；落盘按配置。
-		a.mu.Lock()
-		a.incAll = append(a.incAll, inc)
-		if len(a.incAll) > incKeep {
-			a.incAll = a.incAll[len(a.incAll)-incKeep:]
-		}
-		a.mu.Unlock()
-		a.incLog.Append(inc)
-		// 事件落盘失败必须可见（v0.5.0 曾静默失败 24h，重启丢掉
-		// 全部当日事件）——自愈重试期间用户必须知道时间线不完整。
-		if n, errMsg := a.incLog.Failures(); n == 1 {
-			a.addErr("事件日志写入失败，自动重试中：" + errMsg)
-		}
+		a.addIncident(inc)
+	}
+}
+
+// addIncident 统一落事件：内存时间线（-no-record 时也可用）+ 文件 +
+// 首次写失败可见化（v0.5.0 曾静默失败 24h——丢失本身必须被看见）。
+func (a *App) addIncident(inc store.Incident) {
+	a.mu.Lock()
+	a.incAll = append(a.incAll, inc)
+	if len(a.incAll) > incKeep {
+		a.incAll = a.incAll[len(a.incAll)-incKeep:]
+	}
+	a.mu.Unlock()
+	a.incLog.Append(inc)
+	if n, errMsg := a.incLog.Failures(); n == 1 {
+		a.addErr("事件日志写入失败，自动重试中：" + errMsg)
 	}
 }
 

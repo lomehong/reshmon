@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"sort"
 	"time"
 )
@@ -14,6 +15,37 @@ type recoverPending struct {
 // MinDwellMs 状态迁移确认的最小驻留时长（毫秒）——采集端与重建端共用
 // 同一语义，恢复出的事件与实时记录的口径一致。
 const MinDwellMs = 30_000
+
+// RecorderStallMs 记录器冻结判定阈值：相邻 tick 间隔超过它即视为一次
+// 采样管线停摆（磁盘卡死把阻塞写挂住/系统冻结/睡眠——无论哪种，时间
+// 线都必须诚实标注盲区，而不是让人误以为「当时一切正常」）。
+const RecorderStallMs = 60_000
+
+// ScanGaps 扫描 [from,to] 的 totals 相邻 tick 间隔，返回超过
+// RecorderStallMs 的断档（起点时刻与时长毫秒）。
+func ScanGaps(dir string, from, to time.Time) (gaps []Incident, err error) {
+	recs, _, err := LoadTotals(dir, from, to)
+	if err != nil {
+		return nil, err
+	}
+	var prev int64
+	for _, r := range recs {
+		if prev > 0 && r.T-prev >= RecorderStallMs {
+			gaps = append(gaps, Incident{
+				T:    prev,
+				Dim:  "recorder",
+				From: "ok",
+				To:   "stalled",
+				Detail: fmt.Sprintf("记录器冻结 %.0f 分钟（%s ~ %s 期间数据缺失）",
+					float64(r.T-prev)/60000,
+					time.UnixMilli(prev).Format("15:04:05"),
+					time.UnixMilli(r.T).Format("15:04:05")),
+			})
+		}
+		prev = r.T
+	}
+	return gaps, nil
+}
 
 // RecoverIncidents 从 totals 的逐拍健康状态图（h 字段）重建 [from,to]
 // 内缺失的事件，返回需要补写的事件列表。用于 incidents 静默失败事故

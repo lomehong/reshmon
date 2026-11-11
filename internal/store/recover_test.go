@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,7 +101,41 @@ func sortSlice(s []Incident, less func(i, j int) bool) {
 	}
 }
 
-// 幂等：对同一数据跑两次，第二次无新增（去重索引覆盖已补写的事件）。
+// 断档扫描：相邻 tick 间隔超阈值 → 生成 recorder 冻结事件（含时长与
+// 起止时刻）；短间隔不误报。
+func TestScanGaps(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 11, 10, 10, 0, 0, 0, time.Local)
+	day := dayKey(base)
+	writeRecoverTick(t, dir, day, base.UnixMilli(), "ok")
+	writeRecoverTick(t, dir, day, base.Add(2*time.Second).UnixMilli(), "ok")
+	writeRecoverTick(t, dir, day, base.Add(10*time.Minute).UnixMilli(), "ok") // 冻结 9 分 58 秒后恢复
+	writeRecoverTick(t, dir, day, base.Add(10*time.Minute+2*time.Second).UnixMilli(), "ok")
+
+	gaps, err := ScanGaps(dir, base, base.Add(time.Hour))
+	if err != nil || len(gaps) != 1 {
+		t.Fatalf("应发现 1 次冻结: %+v %v", gaps, err)
+	}
+	g := gaps[0]
+	if g.Dim != "recorder" || g.From != "ok" || g.To != "stalled" {
+		t.Fatalf("冻结事件字段错误: %+v", g)
+	}
+	if g.T != base.Add(2*time.Second).UnixMilli() {
+		t.Fatalf("冻结起点应为最后一条正常 tick: %d", g.T)
+	}
+	if !strings.Contains(g.Detail, "10 分钟") || !strings.Contains(g.Detail, "10:00:02") {
+		t.Fatalf("detail 应含冻结时长与起止: %s", g.Detail)
+	}
+	// 无断档 → 不误报（2s 正常间隔）
+	dir2 := t.TempDir()
+	day2 := dayKey(base)
+	writeRecoverTick(t, dir2, day2, base.UnixMilli(), "ok")
+	writeRecoverTick(t, dir2, day2, base.Add(2*time.Second).UnixMilli(), "ok")
+	gaps2, err := ScanGaps(dir2, base, base.Add(time.Hour))
+	if err != nil || len(gaps2) != 0 {
+		t.Fatalf("无断档不应报: %+v %v", gaps2, err)
+	}
+}
 func TestRecoverIncidentsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 11, 10, 10, 0, 0, 0, time.Local)
