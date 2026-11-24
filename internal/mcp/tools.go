@@ -20,10 +20,31 @@ func toolSnapshot(src Source, args json.RawMessage) (any, error) {
 	if snap == nil {
 		return map[string]any{"starting": true, "hint": "首拍采样中，约 1-2 秒后重试"}, nil
 	}
+	// CPU：占用之外按需附带温度/功耗（可选读数，≤0 即不可得时字段缺省）
+	cpuInfo := map[string]any{"busyPct": round1(snap.CPU.BusyPct), "cores": snap.CPU.Cores}
+	if snap.CPU.TempC > 0 {
+		cpuInfo["tempC"] = round1(snap.CPU.TempC)
+		cpuInfo["tempSource"] = "ACPI 热区（封装附近，非核心温度）"
+		if snap.CPU.ThermalStale {
+			cpuInfo["tempNote"] = "读数自启动以来未变化，可能为固件固定值"
+		}
+		if snap.CPU.Throttling {
+			cpuInfo["throttling"] = true
+		}
+	}
+	if snap.CPU.PkgW > 0 {
+		cpuInfo["packagePowerW"] = round1(snap.CPU.PkgW)
+		if snap.CPU.CoreW > 0 {
+			cpuInfo["corePowerW"] = round1(snap.CPU.CoreW)
+		}
+		if snap.CPU.GpuW > 0 {
+			cpuInfo["gpuPowerW"] = round1(snap.CPU.GpuW)
+		}
+	}
 	out := map[string]any{
 		"ts":        snap.TS.Format(time.RFC3339),
 		"overall":   rep.Overall,
-		"cpu":       map[string]any{"busyPct": round1(snap.CPU.BusyPct), "cores": snap.CPU.Cores},
+		"cpu":       cpuInfo,
 		"memory":    map[string]any{"usedPct": round1(snap.Mem.PhysUsedPct), "commitPct": round1(snap.Mem.CommitPct), "availableBytes": snap.Mem.PhysAvailB},
 		"disks":     map[string]any{},
 		"gpus":      map[string]any{},

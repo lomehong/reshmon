@@ -171,7 +171,11 @@ func printHuman(s *model.Snapshot, rep health.Report) {
 			fmt.Printf("  ⚠ %s\n", r)
 		}
 	}
-	fmt.Printf("\nCPU      %s  %d 核\n", bar(s.CPU.BusyPct), s.CPU.Cores)
+	if th := s.CPU.ThermalText(); th != "" {
+		fmt.Printf("\nCPU      %s  %d 核   %s\n", bar(s.CPU.BusyPct), s.CPU.Cores, th)
+	} else {
+		fmt.Printf("\nCPU      %s  %d 核\n", bar(s.CPU.BusyPct), s.CPU.Cores)
+	}
 	usedB := float64(s.Mem.PhysTotalB - s.Mem.PhysAvailB)
 	fmt.Printf("内存     %s  物理 %s / %s   提交 %s / %s\n",
 		bar(s.Mem.PhysUsedPct), model.FmtBytes(usedB), model.FmtBytes(float64(s.Mem.PhysTotalB)),

@@ -3,6 +3,7 @@
 package model
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -39,13 +40,57 @@ type Snapshot struct {
 	NICs      []NICStat
 	Procs     []ProcStat // 全量进程（含归因结果）
 	Agents    []AgentStat
-	CapErrors []string // 采集能力降级说明（如 GPU 计数器缺失）
+	Conns     []ConnStat // 网络连接/监听端点（端口→进程归属）；按需读取，不随 snapshot 接口下发
+	CapErrors []string   // 采集能力降级说明（如 GPU 计数器缺失）
 }
 
 type CPUStat struct {
 	BusyPct float64   `json:"busyPct"` // 全核均值 0-100
 	Cores   int       `json:"cores"`
 	PerCore []float64 `json:"perCore,omitempty"` // 每核 0-100
+
+	// 以下均为可选增强（多数机器有、没有不算采集降级）。
+	// 口径与落盘一致：≤0 一律视为不可得——Go 零值与 JSON 缺字段都是 0，
+	// 只认 -1 会把零值结构体误显示成"0℃ / 0W"。
+	TempC float64 `json:"tempC"` // CPU 封装附近温度（ACPI 热区最热值，非核心温度）
+	PkgW  float64 `json:"pkgW"`  // 封装功率（Windows Energy Meter）
+	CoreW float64 `json:"coreW"` // 核心功率
+	GpuW  float64 `json:"gpuW"`  // 核显功率
+
+	ThermalStale bool `json:"thermalStale,omitempty"` // 温度读数自启动以来从未变化——可能为固件固定值
+	Throttling   bool `json:"throttling,omitempty"`   // ACPI 报告存在节流原因
+}
+
+// ThermalText 温度与功耗的可读摘要，如
+// "温度 57.1℃ · 封装 45.6W（核心 23.2W · 核显 8.8W）"。
+// 不可得（≤0）的项省略，两项都没有时返回空串；once 与终端面板共用。
+func (c CPUStat) ThermalText() string {
+	var parts []string
+	if c.TempC > 0 {
+		s := fmt.Sprintf("温度 %.1f℃", c.TempC)
+		if c.ThermalStale {
+			s += "（读数未变化，可能为固定值）"
+		}
+		if c.Throttling {
+			s += "（ACPI 报告节流）"
+		}
+		parts = append(parts, s)
+	}
+	if c.PkgW > 0 {
+		var sub []string
+		if c.CoreW > 0 {
+			sub = append(sub, fmt.Sprintf("核心 %.1fW", c.CoreW))
+		}
+		if c.GpuW > 0 {
+			sub = append(sub, fmt.Sprintf("核显 %.1fW", c.GpuW))
+		}
+		s := fmt.Sprintf("封装 %.1fW", c.PkgW)
+		if len(sub) > 0 {
+			s += "（" + strings.Join(sub, " · ") + "）"
+		}
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, " · ")
 }
 
 type MemStat struct {
@@ -95,6 +140,16 @@ type NICStat struct {
 	SentBps float64 `json:"sentBps"`
 }
 
+// ConnStat 一条网络连接/监听端点及其归属进程（端口→进程归属）。
+// 瞬时状态，不落盘。
+type ConnStat struct {
+	Proto  string `json:"proto"`            // "TCP" / "UDP"（IPv6 为 "TCP6" / "UDP6"）
+	Local  string `json:"local"`            // "地址:端口"
+	Remote string `json:"remote,omitempty"` // "地址:端口"；监听/UDP 无
+	State  string `json:"state,omitempty"`  // LISTEN/ESTAB/TIME_WAIT…；UDP 无
+	PID    uint32 `json:"pid"`
+}
+
 type ProcStat struct {
 	PID      uint32  `json:"pid"`
 	PPID     uint32  `json:"ppid"`
@@ -128,6 +183,8 @@ type Totals struct {
 	CPU        float64           `json:"cpu"`
 	MemUsedPct float64           `json:"memp"`
 	CommitPct  float64           `json:"commit"`
+	TempC      float64           `json:"tc,omitempty"` // CPU 温度℃；不可得不写（读取端 ≤0 视为不可得）
+	PkgW       float64           `json:"pw,omitempty"` // 封装功率 W；不可得不写
 	Disks      []DiskTotal       `json:"disks,omitempty"`
 	GPUs       []GPUTotal        `json:"gpus,omitempty"`
 	NetRecvBps float64           `json:"nr,omitempty"`

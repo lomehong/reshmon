@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -301,7 +302,10 @@ func downsampleDay(dir, day string) error {
 		n                 int
 		cpu, memp, commit float64
 		nr, ns            float64
-		disks             map[string]*struct {
+		// 温度/功耗为可选读数：按有效拍数（tempN/pkgN）求均值，不被缺测的拍摊薄
+		temp, pkgW  float64
+		tempN, pkgN int
+		disks       map[string]*struct {
 			id, l                 string
 			busy, rb, wb, lat, fp float64
 		}
@@ -333,6 +337,14 @@ func downsampleDay(dir, day string) error {
 		a.commit += r.CommitPct
 		a.nr += r.NetRecvBps
 		a.ns += r.NetSentBps
+		if r.TempC > 0 {
+			a.temp += r.TempC
+			a.tempN++
+		}
+		if r.PkgW > 0 {
+			a.pkgW += r.PkgW
+			a.pkgN++
+		}
 		for _, d := range r.Disks {
 			da := a.disks[d.ID]
 			if da == nil {
@@ -385,6 +397,12 @@ func downsampleDay(dir, day string) error {
 		out := model.Totals{
 			T: b, CPU: a.cpu / n, MemUsedPct: a.memp / n, CommitPct: a.commit / n,
 			NetRecvBps: a.nr / n, NetSentBps: a.ns / n,
+		}
+		if a.tempN > 0 {
+			out.TempC = math.Round(a.temp/float64(a.tempN)*10) / 10
+		}
+		if a.pkgN > 0 {
+			out.PkgW = math.Round(a.pkgW/float64(a.pkgN)*100) / 100
 		}
 		for _, da := range a.disks {
 			out.Disks = append(out.Disks, model.DiskTotal{

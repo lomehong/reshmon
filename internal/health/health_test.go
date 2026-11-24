@@ -180,6 +180,67 @@ func TestDiskKeyStable(t *testing.T) {
 	}
 }
 
+// CPU 温度维度：按有效读数的拍数求均值；≥90℃ 亚健康、≥100℃ 饱和。
+// 没有读数、或有效拍不足半数时不出该维度——机器没有 ACPI 热区是常态，
+// 不能凭空多出一条"CPU 温度 健康"。
+func TestCPUTempDim(t *testing.T) {
+	findDim := func(rep Report, key string) *DimStatus {
+		for i := range rep.Dims {
+			if rep.Dims[i].Key == key {
+				return &rep.Dims[i]
+			}
+		}
+		return nil
+	}
+	mk := func(temp float64) model.Totals {
+		return model.Totals{CPU: 10, MemUsedPct: 30, CommitPct: 30, TempC: temp}
+	}
+
+	// 正常温度：出维度、健康、均值为有效读数之均值（57、59 → 58）
+	rep := NewJudge(DefaultThresholds(), 2).Evaluate([]model.Totals{mk(57), mk(59)})
+	d := findDim(rep, "cpuTemp")
+	if d == nil || d.Status != model.StatusOK || d.Value != 58 {
+		t.Fatalf("正常温度维度错误: %+v", d)
+	}
+	if !strings.Contains(d.Detail, "ACPI") {
+		t.Fatalf("detail 应标明来源: %s", d.Detail)
+	}
+	if rep.Overall != model.StatusOK {
+		t.Fatalf("正常温度不应影响整体: %s", rep.Overall)
+	}
+
+	// 92℃ → 亚健康；101℃ → 饱和
+	if rep := NewJudge(DefaultThresholds(), 2).Evaluate([]model.Totals{mk(92), mk(92)}); rep.Overall != model.StatusWarn {
+		t.Fatalf("92℃ 应亚健康: %s", rep.Overall)
+	}
+	if rep := NewJudge(DefaultThresholds(), 2).Evaluate([]model.Totals{mk(101), mk(101)}); rep.Overall != model.StatusSat {
+		t.Fatalf("101℃ 应饱和: %s", rep.Overall)
+	}
+
+	// 无读数（0 = 不可得）：不出维度，整体健康
+	rep = NewJudge(DefaultThresholds(), 2).Evaluate([]model.Totals{mk(0), mk(0)})
+	if findDim(rep, "cpuTemp") != nil || rep.Overall != model.StatusOK {
+		t.Fatalf("无温度读数时不应产生温度维度: %+v", rep)
+	}
+
+	// 有效拍不足半数（3 拍里只有 1 拍有读数）：不出维度，避免单拍偶发读数触发告警
+	rep = NewJudge(DefaultThresholds(), 3).Evaluate([]model.Totals{mk(95), mk(0), mk(0)})
+	if findDim(rep, "cpuTemp") != nil {
+		t.Fatalf("有效拍不足半数时不应产生温度维度: %+v", rep.Dims)
+	}
+
+	// 阈值可配置：把告警线调到 60℃ 后，58℃ 不告警、62℃ 告警
+	th := DefaultThresholds()
+	th.CPUTempWarnC, th.CPUTempSatC = 60, 70
+	j := NewJudge(th, 2)
+	if rep := j.Evaluate([]model.Totals{mk(58), mk(58)}); findDim(rep, "cpuTemp").Status != model.StatusOK {
+		t.Fatalf("58℃ 在 60℃ 阈值下应健康: %+v", rep)
+	}
+	if rep := j.Evaluate([]model.Totals{mk(62), mk(62)}); rep.Overall != model.StatusWarn {
+		t.Fatalf("62℃ 在 60℃ 阈值下应亚健康: %s", rep.Overall)
+	}
+}
+
 // 磁盘剩余空间维度：低向好 ≤10% warn、≤5% sat；-1（不可得）不影响。
 func TestDiskFreeDim(t *testing.T) {
 	j := NewJudge(DefaultThresholds(), 2)

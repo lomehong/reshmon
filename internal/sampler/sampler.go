@@ -72,6 +72,10 @@ type Sampler struct {
 	cGPUAd  map[string]*syswin.PDHCounter
 	cNet    map[string]*syswin.PDHCounter
 
+	// 可选增强（缺失不算降级）：ACPI 热区温度、节流原因、Energy Meter 功耗
+	cThermal map[string]*syswin.PDHCounter
+	cPower   *syswin.PDHCounter
+
 	capErrs []string
 	capSeen map[string]bool
 
@@ -79,6 +83,11 @@ type Sampler struct {
 
 	// rms/wms 计数器的真实时间基准（PERF_AVERAGE_TIMER 换算用）。
 	diskBase map[string]float64
+
+	// 热区固定值检测：各热区上一次原始值、自启动以来是否变过；ticks 为采样拍数
+	thermalSeen    map[string]int64
+	thermalChanged bool
+	ticks          int
 
 	adapterCache []syswin.DXGIAdapter
 	adapterAt    time.Time
@@ -109,18 +118,20 @@ func New(interval time.Duration, patterns []attrib.Pattern) (*Sampler, error) {
 		return nil, err
 	}
 	s := &Sampler{
-		interval:  interval,
-		q:         q,
-		cDisk:     map[string]*syswin.PDHCounter{},
-		cGPUMem:   map[string]*syswin.PDHCounter{},
-		cGPUAd:    map[string]*syswin.PDHCounter{},
-		cNet:      map[string]*syswin.PDHCounter{},
-		capSeen:   map[string]bool{},
-		prevRaw:   map[string]rawSet{},
-		diskBase:  map[string]float64{},
-		numCPU:    syswin.ActiveCPUCount(),
-		prevProcs: map[uint32]procAcc{},
-		engine:    attrib.New(patterns),
+		interval:    interval,
+		q:           q,
+		cDisk:       map[string]*syswin.PDHCounter{},
+		cGPUMem:     map[string]*syswin.PDHCounter{},
+		cGPUAd:      map[string]*syswin.PDHCounter{},
+		cNet:        map[string]*syswin.PDHCounter{},
+		cThermal:    map[string]*syswin.PDHCounter{},
+		capSeen:     map[string]bool{},
+		prevRaw:     map[string]rawSet{},
+		diskBase:    map[string]float64{},
+		thermalSeen: map[string]int64{},
+		numCPU:      syswin.ActiveCPUCount(),
+		prevProcs:   map[uint32]procAcc{},
+		engine:      attrib.New(patterns),
 	}
 	if s.numCPU < 1 {
 		s.numCPU = 1
@@ -155,6 +166,17 @@ func New(interval time.Duration, patterns []attrib.Pattern) (*Sampler, error) {
 	addMap(s.cGPUAd, gpuAdaptMemPaths)
 	addMap(s.cNet, netPaths)
 
+	// 可选增强：ACPI 热区温度 / 节流原因 / Energy Meter 功耗。
+	// 添加失败一律静默——没有这些计数器的机器不该被标成"采集降级"。
+	for k, p := range thermalPaths {
+		if c, err := q.Add(p); err == nil {
+			s.cThermal[k] = c
+		}
+	}
+	if c, err := q.Add(pathEnergyPower); err == nil {
+		s.cPower = c
+	}
+
 	if err := q.Collect(); err != nil && !syswin.IsPDHSoft(err) {
 		s.noteCap(err.Error())
 	}
@@ -174,10 +196,16 @@ func (s *Sampler) noteCap(msg string) {
 // Interval 采样间隔（UI 提示用；速率差分用真实时间戳）。
 func (s *Sampler) Interval() time.Duration { return s.interval }
 
+// Conns 按需枚举当前网络端点及其归属 PID（端口→进程归属）。
+// 不进周期采样：连接表变化快、体积大，只在面板/接口显式请求时读取，
+// 避免每拍都做一次数千行的枚举。
+func (s *Sampler) Conns() ([]model.ConnStat, error) { return syswin.EnumConns() }
+
 // Tick 执行一次采集并返回完整快照。
 func (s *Sampler) Tick() *model.Snapshot {
 	now := time.Now()
 	collectErr := s.q.Collect()
+	s.ticks++
 	snap := &model.Snapshot{TS: now, CPU: model.CPUStat{Cores: s.numCPU}}
 
 	cur := map[string]rawSet{}
@@ -185,6 +213,7 @@ func (s *Sampler) Tick() *model.Snapshot {
 	s.readDisks(snap, cur)
 	gpuByPid, vramByPid := s.readGPUs(snap, cur)
 	s.readNet(snap, cur)
+	s.readThermal(snap, cur)
 	s.prevRaw = cur
 
 	s.readMem(snap)

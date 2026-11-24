@@ -28,6 +28,10 @@ type Thresholds struct {
 	GPUUtilSaturated float64 `json:"gpuUtilSaturated"`
 	VRAMDegraded     float64 `json:"vramDegraded"`
 	VRAMSaturated    float64 `json:"vramSaturated"`
+	// CPU 温度℃（ACPI 封装附近温度，非核心温度——阈值比核心温度口径保守）。
+	// 采集不到温度的机器不产生该维度。
+	CPUTempWarnC float64 `json:"cpuTempWarnC"`
+	CPUTempSatC  float64 `json:"cpuTempSatC"`
 }
 
 func DefaultThresholds() Thresholds {
@@ -48,6 +52,8 @@ func DefaultThresholds() Thresholds {
 		GPUUtilSaturated:   95,
 		VRAMDegraded:       88,
 		VRAMSaturated:      96,
+		CPUTempWarnC:       90,
+		CPUTempSatC:        100,
 	}
 }
 
@@ -188,6 +194,23 @@ func (j *Judge) Evaluate(recs []model.Totals) Report {
 	add(DimStatus{Key: "cpu", Label: "CPU", Status: j.classify("cpu", cpu, j.Th.CPUDegraded, j.Th.CPUSaturated), Value: cpu, Unit: "%", Detail: fmt.Sprintf("均值 %.1f%%", cpu)})
 	add(DimStatus{Key: "mem", Label: "内存", Status: j.classify("mem", mem, j.Th.MemDegraded, j.Th.MemSaturated), Value: mem, Unit: "%", Detail: fmt.Sprintf("物理占用均值 %.1f%%", mem)})
 	add(DimStatus{Key: "commit", Label: "提交内存", Status: j.classify("commit", commit, j.Th.CommitDegraded, j.Th.CommitSaturated), Value: commit, Unit: "%", Detail: fmt.Sprintf("提交均值 %.1f%%", commit)})
+
+	// CPU 温度：按窗口内有效读数的拍数求均值（采集不到的拍不摊薄）。
+	// 有效拍不足半数视为该机器没有温度读数，不出维度——没有 ACPI 热区是常态，
+	// 不能因此凭空多出一条"CPU 温度 健康"。
+	var temp float64
+	tempN := 0
+	for _, r := range recs {
+		if r.TempC > 0 {
+			temp += r.TempC
+			tempN++
+		}
+	}
+	if tempN > 0 && tempN*2 >= len(recs) {
+		temp /= float64(tempN)
+		add(DimStatus{Key: "cpuTemp", Label: "CPU 温度", Status: j.classify("cpuTemp", temp, j.Th.CPUTempWarnC, j.Th.CPUTempSatC), Value: temp, Unit: "℃",
+			Detail: fmt.Sprintf("均值 %.1f℃（ACPI 封装附近温度）", temp)})
+	}
 
 	// 磁盘：按物理盘身份键聚合均值；均值分母用该盘实际出现的次数——
 	// 实例缺席的 tick 不摊薄（拔插盘/实例名重建不导致持续打满的盘漏报）。

@@ -49,6 +49,16 @@
   .tbl-scroll{max-height:400px;overflow-y:auto}
   .tbl-scroll thead th{position:sticky;top:0;background:var(--panel);z-index:1}
   .inc-scroll{max-height:320px;overflow-y:auto}
+  /* 回溯结果与连接表 */
+  .athint{color:var(--dim);font-size:11px;margin-top:6px}
+  #atResult{max-height:260px}
+  #atResult .atHead{padding:6px 0;border-bottom:1px solid var(--border)}
+  #atResult .dim,.dim{color:var(--dim)}
+  #atResult .warn{color:var(--warn)}
+  .conn-bar{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .conn-bar input{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:6px;
+    color:var(--text);padding:4px 8px;font-size:12px;outline:none}
+  .conn-bar input:focus{border-color:var(--accent)}
   .tbl-scroll::-webkit-scrollbar,.inc-scroll::-webkit-scrollbar{width:8px}
   .tbl-scroll::-webkit-scrollbar-thumb,.inc-scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
   .cols{display:grid; grid-template-columns:1fr 1fr; gap:14px}
@@ -68,6 +78,8 @@
   </h2>
   <canvas id="chart"></canvas>
   <div class="legend" id="legend"></div>
+  <div class="athint">点击曲线上任意时刻 → 回溯"当时是谁在吃资源"</div>
+  <div id="atResult" class="inc-scroll"></div>
 </section>
 
 <div class="cols">
@@ -78,12 +90,29 @@
     </tr></thead><tbody></tbody></table></div>
   </section>
   <section>
+    <h2>端口 → 进程（监听在前）</h2>
+    <div class="conn-bar">
+      <input id="connSearch" placeholder="按端口或进程名过滤，如 443 / chrome" />
+      <span class="dim" id="connSummary"></span>
+    </div>
+    <div class="tbl-scroll"><table id="conns"><thead><tr>
+      <th>协议</th><th>本地地址</th><th>对端</th><th>状态</th><th class="num">PID</th><th>进程</th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+</div>
+
+<div class="cols">
+  <section>
     <h2>进程 Top（点击列头排序）</h2>
     <div class="tbl-scroll"><table id="procs"><thead><tr>
       <th data-k="pid">PID</th><th data-k="n">进程</th><th data-k="a">归属</th>
       <th data-k="cpu" class="num">CPU%</th><th data-k="priv" class="num">内存</th>
       <th data-k="io" class="num">磁盘 读/写</th><th data-k="gpu" class="num">GPU%</th><th data-k="vram" class="num">显存</th>
     </tr></thead><tbody></tbody></table></div>
+  </section>
+  <section>
+    <h2>健康事件（状态迁移，最近 7 天）</h2>
+    <div id="incidents" class="inc-scroll"><div class="empty">暂无事件</div></div>
   </section>
 </div>
 
@@ -129,8 +158,11 @@ function sparkKey(key){
     if(key==="cpu")return t.cpu;
     if(key==="memp")return t.memp;
     if(key==="commit")return t.commit;
+    if(key==="temp")return t.tc||null;
+    if(key==="power")return t.pw||null;
     if(key&&key.startsWith("disk:")){const kk=key.slice(5);const d=(t.disks||[]).find(x=>(x.id||"").split(" ")[0]===kk);return d?d.busy:null}
-    if(key&&key.startsWith("gpu:")){const g=(t.gpus||[]).find(x=>x.k===key.slice(4));return g?g.u:null}    return null}).filter(v=>v!=null);
+    if(key&&key.startsWith("gpu:")){const g=(t.gpus||[]).find(x=>x.k===key.slice(4));return g?g.u:null}
+    return null}).filter(v=>v!=null);
 }
 function sparkColor(idx){return PAL[idx%PAL.length]}
 
@@ -140,7 +172,21 @@ function renderCards(){
   const box=$("#cards");box.innerHTML="";
   if(!SNAP||SNAP.starting||!SNAP.cpu)return; // 启动前 1-2s 静默等待，不算错误
   const hs=dimMap(),cards=[];
-  cards.push({k:"cpu",st:hs.cpu,name:"CPU",val:pct(SNAP.cpu.busyPct),sub:SNAP.cpu.cores+" 核",v:SNAP.cpu.busyPct});
+  // CPU 卡片副标题带上温度/功耗（可选读数：服务端没有就不显示，不写 0）
+  const cpu=SNAP.cpu;let cpuSub=cpu.cores+" 核";
+  if(cpu.tempC>0){
+    cpuSub+=" · "+cpu.tempC.toFixed(1)+"℃";
+    if(cpu.thermalStale)cpuSub+="（固定值?）";
+  }
+  if(cpu.pkgW>0){
+    cpuSub+=" · "+cpu.pkgW.toFixed(1)+"W";
+    const parts=[];
+    if(cpu.coreW>0)parts.push("核 "+cpu.coreW.toFixed(1));
+    if(cpu.gpuW>0)parts.push("显 "+cpu.gpuW.toFixed(1));
+    if(parts.length)cpuSub+="（"+parts.join(" / ")+"）";
+  }
+  if(cpu.throttling)cpuSub+=" · 节流";
+  cards.push({k:"cpu",st:hs.cpu,name:"CPU",val:pct(cpu.busyPct),sub:cpuSub,v:cpu.busyPct});
   const m=SNAP.mem;
   cards.push({k:"memp",st:hs.mem,name:"内存",val:pct(m.physUsedPct),sub:fmtB(m.physTotalB)+" 物理 · 可用 "+fmtB(m.physAvailB),v:m.physUsedPct});
   cards.push({k:"commit",st:hs.commit,name:"提交内存",val:pct(m.commitPct),sub:fmtB(m.commitTotalB)+" / "+fmtB(m.commitLimitB),v:m.commitPct});
@@ -157,7 +203,7 @@ function renderCards(){
   });
 }
 
-const METRICS=[["cpu","CPU"],["memp","内存"],["commit","提交"],["disk:*","磁盘忙"],["gpu:*","GPU"],["net","网络 MB/s"]];
+const METRICS=[["cpu","CPU"],["memp","内存"],["commit","提交"],["temp","温度"],["power","功耗"],["disk:*","磁盘忙"],["gpu:*","GPU"],["net","网络 MB/s"]];
 function renderChips(){
   $("#metricChips").innerHTML=METRICS.map(m=>`<span class="chip ${METRIC===m[0]?"on":""}" data-m="${m[0]}">${m[1]}</span>`).join("");
   $("#metricChips").querySelectorAll(".chip").forEach(ch=>ch.onclick=()=>{METRIC=ch.dataset.m;renderChips();drawChart()});
@@ -171,6 +217,8 @@ function chartSeries(){
   if(METRIC==="cpu")out.push({label:"CPU %",color:PAL[0],data:HIST.map(t=>[t.t,t.cpu]),max:100});
   else if(METRIC==="memp")out.push({label:"内存 %",color:PAL[1],data:HIST.map(t=>[t.t,t.memp]),max:100});
   else if(METRIC==="commit")out.push({label:"提交 %",color:PAL[2],data:HIST.map(t=>[t.t,t.commit]),max:100});
+  else if(METRIC==="temp")out.push({label:"CPU 温度 ℃",color:PAL[3],data:HIST.filter(t=>t.tc>0).map(t=>[t.t,t.tc]),max:0});
+  else if(METRIC==="power")out.push({label:"封装功耗 W",color:PAL[4],data:HIST.filter(t=>t.pw>0).map(t=>[t.t,t.pw]),max:0});
   else if(METRIC==="net")out.push({label:"网络 MB/s",color:PAL[0],data:HIST.map(t=>[t.t,(t.nr+t.ns)/1048576]),max:0});
   else if(METRIC==="disk:*"){
     const ids=new Map();
@@ -213,9 +261,64 @@ function drawChart(){
   }else if(t1-HIST[0].t<RANGE*1000-60000){
     legendParts.push(`<span>已采样 ${fmtSpan(t1-HIST[0].t)} / 目标 ${RANGE/60} 分钟</span>`);
   }
+  // 回溯游标：点击趋势图后画一条竖线，标出正在看的是哪一时刻
+  if(CURSOR.T){
+    const x=L+(CURSOR.T-t0)/(t1-t0)*(W-L-R);
+    if(x>=L&&x<=W-R){
+      c.beginPath();c.moveTo(x,T);c.lineTo(x,H-B);
+      c.strokeStyle="#d29922";c.lineWidth=1;c.setLineDash([3,3]);c.stroke();c.setLineDash([]);
+      const d=new Date(CURSOR.T);
+      c.fillStyle="#d29922";
+      c.fillText(("0"+d.getHours()).slice(-2)+":"+("0"+d.getMinutes()).slice(-2)+":"+("0"+d.getSeconds()).slice(-2),Math.min(x+4,W-60),T+10);
+    }
+  }
   $("#legend").innerHTML=legendParts.join("")||"<span>暂无数据</span>";
 }
 function fmtSpan(ms){const m=Math.round(ms/60000);return m>=1?m+" 分钟":"&lt;1 分钟"}
+
+// ---- 点击趋势图回溯"当时是谁"（借鉴 Argus 的历史交互）----
+let CURSOR={T:0};
+function chartTimeAt(ev){
+  const cv=$("#chart"),r=cv.getBoundingClientRect();
+  const L=44,R=10,W=r.width;
+  const x=ev.clientX-r.left;
+  if(x<L||x>W-R)return 0;
+  const t1=Date.now(),t0=t1-RANGE*1000;
+  return Math.round(t0+(x-L)/(W-L-R)*(t1-t0));
+}
+async function seekTo(ms){
+  if(!ms)return;
+  CURSOR={T:ms};
+  drawChart();
+  const box=$("#atResult");
+  box.innerHTML='<span class="empty">读取该时刻的进程…</span>';
+  try{
+    const r=await(await fetch("/api/at?t="+ms)).json();
+    if(r.blind){
+      // 数据缺失如实说明，不给一个空列表让人误读成"当时没进程"
+      box.innerHTML=`<span class="warn">⚠ ${esc(r.reason||"该时刻没有数据")}</span>`;
+      return;
+    }
+    const s=r.slice||{},procs=s.procs||[];
+    const rows=procs.slice(0,15).map(p=>`<tr>
+      <td class="mono">${p.pid}</td><td title="${esc(p.n)}">${esc(p.n)}</td>
+      <td>${esc(p.a||"")}</td><td class="num">${(p.cpu||0).toFixed(1)}</td>
+      <td class="num">${fmtB(p.priv)}</td>
+      <td class="num">${fmtB((p.rb||0)+(p.wb||0))}/s</td></tr>`).join("");
+    const when=new Date(s.t);
+    box.innerHTML=`<div class="atHead">回溯时刻 <b>${when.toLocaleString("zh-CN",{hour12:false})}</b>
+      <span class="dim">（CPU ${(s.cpu||0).toFixed(1)}% · 内存 ${(s.memp||0).toFixed(1)}%）</span></div>
+      <table><thead><tr><th>PID</th><th>进程</th><th>归属</th><th class="num">CPU%</th><th class="num">内存</th><th class="num">磁盘 读/写</th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="6" class="empty">该时刻无进程记录</td></tr>'}</tbody></table>`;
+  }catch(e){
+    box.innerHTML=`<span class="warn">回溯失败：${esc(e)}</span>`;
+  }
+}
+function bindChartSeek(){
+  const cv=$("#chart");
+  cv.style.cursor="crosshair";
+  cv.addEventListener("click",ev=>seekTo(chartTimeAt(ev)));
+}
 
 function renderAgents(){
   const tb=$("#agents tbody"),as=(SNAP&&SNAP.agents)||[];
@@ -293,13 +396,41 @@ async function loadIncidents(){
   try{const r=await(await fetch("/api/incidents?n=80")).json();renderIncidents(r.incidents)}
   catch(e){}
 }
+// ---- 端口 → 进程表 ----
+let CONNS=[];
+async function loadConns(){
+  try{
+    const r=await(await fetch("/api/conns")).json();
+    CONNS=r.conns||[];renderConns(); 
+  }catch(e){$("#connSummary").textContent="连接表获取失败"}
+}
+function renderConns(){
+  const q=($("#connSearch").value||"").trim().toLowerCase();
+  const rows=CONNS.filter(c=>!q||(c.local||"").includes(q)||(c.remote||"").includes(q)||
+    String(c.pid)===q||(c.proc||"").toLowerCase().includes(q));
+  const tb=$("#conns tbody");
+  if(!rows.length){tb.innerHTML='<tr><td colspan="6" class="empty">无匹配端点</td></tr>';
+    $("#connSummary").textContent=`共 ${CONNS.length} 条`;return}
+  tb.innerHTML=rows.slice(0,300).map(c=>`<tr>
+    <td>${esc(c.proto)}</td>
+    <td class="mono" title="${esc(c.local)}">${esc(c.local)}</td>
+    <td class="mono" title="${esc(c.remote||"")}">${esc(c.remote||"")}</td>
+    <td>${esc(c.state||"")}</td>
+    <td class="num mono">${c.pid}</td>
+    <td title="${esc(c.proc||"")}">${esc(c.proc||"—")}</td></tr>`).join("");
+  $("#connSummary").textContent=`显示 ${Math.min(rows.length,300)} / 共 ${CONNS.length} 条`;
+}
+$("#connSearch").addEventListener("input",renderConns);
+
 async function loadAll(){await Promise.all([loadSnapshot(),loadHistory()])}
 
 renderChips();
-loadAll();loadIncidents();
+bindChartSeek();
+loadAll();loadIncidents();loadConns();
 setInterval(loadSnapshot,2000);
 setInterval(loadHistory,4000);
 setInterval(loadIncidents,15000);
+setInterval(loadConns,5000);
 window.addEventListener("resize",()=>{drawChart();renderCards()});
 </script>
 </body>

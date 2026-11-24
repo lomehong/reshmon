@@ -96,6 +96,10 @@ func render(a *app.App) {
 		}
 	}
 	b.WriteString(cReset + "\n")
+	// 温度/功耗：只在有读数时显示（机器没有 ACPI 热区是常态）
+	if th := snap.CPU.ThermalText(); th != "" {
+		fmt.Fprintf(&b, "温度  %s\n", th)
+	}
 
 	used := float64(snap.Mem.PhysTotalB - snap.Mem.PhysAvailB)
 	fmt.Fprintf(&b, "内存  %s  %s / %s   提交 %s / %s (%.0f%%)\n",

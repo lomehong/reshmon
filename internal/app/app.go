@@ -56,6 +56,9 @@ type App struct {
 	pending    map[string]pendingInc // 挂起中的状态迁移（防抖确认期）
 	lastTickAt time.Time             // 上一个成功 tick 的时刻（冻结看门狗）
 	tickN      int
+	// procSlices 每拍进程概览的环形缓冲，供面板点击趋势图回溯当时进程。
+	procSlices []procSlice
+	sliceAt    int // 下一个写入位置（环形）
 
 	stopCh chan struct{}
 	doneCh chan struct{}
@@ -231,6 +234,10 @@ func (a *App) step(baseline bool) {
 
 	a.recordTransitions(rep, snap)
 	a.ring.Push(totals)
+	// 进程切片进内存环形缓冲：面板"点击趋势图某一时刻"回溯当时进程用。
+	// 与落盘切片（每 ProcTicks 拍）不同，这里每拍都留一份概览——
+	// 只存 Top 进程与控制端需要的字段，内存开销可控（ringProcs 拍）。
+	a.pushProcSlice(snap)
 
 	if a.writer != nil {
 		if err := a.writer.Append(totals); err != nil {
@@ -342,6 +349,9 @@ func (a *App) Ring() *store.Ring { return a.ring }
 // Interval 采样间隔（MCP 等消费者换算窗口 tick 数用）。
 func (a *App) Interval() time.Duration { return a.Cfg.Interval }
 
+// Conns 按需枚举网络端点及其归属 PID（端口→进程归属），不走周期采样。
+func (a *App) Conns() ([]model.ConnStat, error) { return a.s.Conns() }
+
 // Incidents 最近 incKeep 条状态迁移（内存副本——含启动时回放的历史，
 // -no-record 模式下也有当前会话的事件）。
 func (a *App) Incidents() []store.Incident {
@@ -402,6 +412,13 @@ func TotalsFrom(s *model.Snapshot) model.Totals {
 		MemUsedPct: s.Mem.PhysUsedPct,
 		CommitPct:  s.Mem.CommitPct,
 		Agents:     s.Agents,
+	}
+	// 温度/功耗为可选读数：不可得（≤0）时不写，读取端同样按 ≤0 视为不可得
+	if s.CPU.TempC > 0 {
+		t.TempC = s.CPU.TempC
+	}
+	if s.CPU.PkgW > 0 {
+		t.PkgW = s.CPU.PkgW
 	}
 	for _, d := range s.Disks {
 		t.Disks = append(t.Disks, model.DiskTotal{

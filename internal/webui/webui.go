@@ -155,6 +155,57 @@ func handler(a *app.App, allowedHosts map[string]bool) http.Handler {
 		writeJSON(w, map[string]any{"ts": snap.TS.Format(time.RFC3339), "procs": procs})
 	})
 
+	// 回溯某一时刻的进程概览（面板点击趋势图）：t 为 unix 毫秒。
+	// 落在数据缺失区间时返回 blind + 原因，不返回空列表。
+	mux.HandleFunc("/api/at", func(w http.ResponseWriter, r *http.Request) {
+		ms, err := strconv.ParseInt(r.URL.Query().Get("t"), 10, 64)
+		if err != nil || ms <= 0 {
+			http.Error(w, "需要 t=<unix 毫秒>", http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, a.At(time.UnixMilli(ms)))
+	})
+
+	// 端口→进程归属：按需枚举（不进周期采样），支持按端口/进程过滤。
+	mux.HandleFunc("/api/conns", func(w http.ResponseWriter, r *http.Request) {
+		conns, err := a.Conns()
+		if err != nil {
+			http.Error(w, "枚举网络端点失败："+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		// 附进程名，便于直接回答"谁在监听/连这个端口"
+		names := map[uint32]string{}
+		if snap, _ := a.Current(); snap != nil {
+			for _, p := range snap.Procs {
+				names[p.PID] = p.Name
+			}
+		}
+		portFilter := r.URL.Query().Get("port")
+		pidFilter := r.URL.Query().Get("pid")
+		rows := make([]map[string]any, 0, len(conns))
+		for _, c := range conns {
+			if pidFilter != "" && strconv.FormatUint(uint64(c.PID), 10) != pidFilter {
+				continue
+			}
+			if portFilter != "" && !connPortMatches(c, portFilter) {
+				continue
+			}
+			rows = append(rows, map[string]any{
+				"proto": c.Proto, "local": c.Local, "remote": c.Remote,
+				"state": c.State, "pid": c.PID, "proc": names[c.PID],
+			})
+		}
+		// 监听在前、再按端口排序，便于扫读
+		sort.Slice(rows, func(i, j int) bool {
+			li, lj := rows[i]["state"] == "LISTEN", rows[j]["state"] == "LISTEN"
+			if li != lj {
+				return li
+			}
+			return rows[i]["local"].(string) < rows[j]["local"].(string)
+		})
+		writeJSON(w, map[string]any{"conns": rows, "total": len(conns)})
+	})
+
 	mux.HandleFunc("/api/incidents", func(w http.ResponseWriter, r *http.Request) {
 		n := 50
 		if v, err := strconv.Atoi(r.URL.Query().Get("n")); err == nil && v > 0 && v <= 500 {
@@ -207,6 +258,19 @@ func handler(a *app.App, allowedHosts map[string]bool) http.Handler {
 		})
 	}
 	return mux
+}
+
+// connPortMatches 按端口过滤端点：匹配本地端口或对端端口。
+func connPortMatches(c model.ConnStat, port string) bool {
+	for _, addr := range []string{c.Local, c.Remote} {
+		if addr == "" {
+			continue
+		}
+		if _, p, err := net.SplitHostPort(addr); err == nil && p == port {
+			return true
+		}
+	}
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
