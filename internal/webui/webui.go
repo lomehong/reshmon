@@ -5,6 +5,7 @@
 package webui
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/json"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"os/signal"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/lomehong/reshmon/internal/app"
@@ -166,43 +168,24 @@ func handler(a *app.App, allowedHosts map[string]bool) http.Handler {
 		writeJSON(w, a.At(time.UnixMilli(ms)))
 	})
 
-	// 端口→进程归属：按需枚举（不进周期采样），支持按端口/进程过滤。
+	// 端口→进程归属：按需枚举（不进周期采样），支持按端口/PID 过滤。
 	mux.HandleFunc("/api/conns", func(w http.ResponseWriter, r *http.Request) {
 		conns, err := a.Conns()
 		if err != nil {
 			http.Error(w, "枚举网络端点失败："+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		// 附进程名，便于直接回答"谁在监听/连这个端口"
-		names := map[uint32]string{}
+		// 附进程名与 Agent 归属（取自最近一拍快照）
+		owners := map[uint32]connOwner{}
 		if snap, _ := a.Current(); snap != nil {
 			for _, p := range snap.Procs {
-				names[p.PID] = p.Name
+				if _, ok := owners[p.PID]; !ok {
+					owners[p.PID] = connOwner{proc: p.Name, agent: p.Agent}
+				}
 			}
 		}
-		portFilter := r.URL.Query().Get("port")
-		pidFilter := r.URL.Query().Get("pid")
-		rows := make([]map[string]any, 0, len(conns))
-		for _, c := range conns {
-			if pidFilter != "" && strconv.FormatUint(uint64(c.PID), 10) != pidFilter {
-				continue
-			}
-			if portFilter != "" && !connPortMatches(c, portFilter) {
-				continue
-			}
-			rows = append(rows, map[string]any{
-				"proto": c.Proto, "local": c.Local, "remote": c.Remote,
-				"state": c.State, "pid": c.PID, "proc": names[c.PID],
-			})
-		}
-		// 监听在前、再按端口排序，便于扫读
-		sort.Slice(rows, func(i, j int) bool {
-			li, lj := rows[i]["state"] == "LISTEN", rows[j]["state"] == "LISTEN"
-			if li != lj {
-				return li
-			}
-			return rows[i]["local"].(string) < rows[j]["local"].(string)
-		})
+		q := r.URL.Query()
+		rows := buildConnRows(conns, owners, q.Get("port"), q.Get("pid"))
 		writeJSON(w, map[string]any{"conns": rows, "total": len(conns)})
 	})
 
@@ -260,6 +243,40 @@ func handler(a *app.App, allowedHosts map[string]bool) http.Handler {
 	return mux
 }
 
+// connOwner 一个 PID 对应的归属信息（进程名 + Agent 桶）。
+type connOwner struct{ proc, agent string }
+
+// connRow 一条端点及其归属（/api/conns 的输出行）。
+type connRow struct {
+	Proto  string `json:"proto"`
+	Local  string `json:"local"`
+	Remote string `json:"remote,omitempty"`
+	State  string `json:"state,omitempty"`
+	PID    uint32 `json:"pid"`
+	Proc   string `json:"proc,omitempty"`
+	Agent  string `json:"agent,omitempty"`
+}
+
+// buildConnRows 过滤、附归属并排序端点。port/pid 为空表示不过滤。
+func buildConnRows(conns []model.ConnStat, owners map[uint32]connOwner, port, pid string) []connRow {
+	rows := make([]connRow, 0, len(conns))
+	for _, c := range conns {
+		if pid != "" && strconv.FormatUint(uint64(c.PID), 10) != pid {
+			continue
+		}
+		if port != "" && !connPortMatches(c, port) {
+			continue
+		}
+		o := owners[c.PID]
+		rows = append(rows, connRow{
+			Proto: c.Proto, Local: c.Local, Remote: c.Remote, State: c.State,
+			PID: c.PID, Proc: o.proc, Agent: o.agent,
+		})
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return connCompare(rows[i], rows[j]) < 0 })
+	return rows
+}
+
 // connPortMatches 按端口过滤端点：匹配本地端口或对端端口。
 func connPortMatches(c model.ConnStat, port string) bool {
 	for _, addr := range []string{c.Local, c.Remote} {
@@ -271,6 +288,81 @@ func connPortMatches(c model.ConnStat, port string) bool {
 		}
 	}
 	return false
+}
+
+// connGroup 端点分组（排序的第一优先级）：
+//
+//	0 = 可接入的端点（TCP 监听 / UDP 绑定）——"谁占着这个端口"找的就是这些
+//	1 = 其余连接（已建立、等待关闭等）
+//	2 = 本地端口为 0 的端点——系统临时套接字（发 DNS 等一次性用途），
+//	    按端口查不到它们，按数值排序又会全部挤到最前面（实测一台机器
+//	    上有 38 条），所以单独放最后。
+func connGroup(c connRow) int {
+	if _, p := splitEndpoint(c.Local); p == 0 {
+		return 2
+	}
+	if c.State == "LISTEN" || strings.HasPrefix(c.Proto, "UDP") {
+		return 0
+	}
+	return 1
+}
+
+// connCompare 端点排序依据：可接入的端点在前；两组内部都按**本地端口数值**
+// 升序——端口是这张表的主键，按地址字符串排序会把 445 排到 15100 之后。
+// 同端口再依次按协议、本地 IP、对端、PID。返回负/零/正。
+func connCompare(a, b connRow) int {
+	if ga, gb := connGroup(a), connGroup(b); ga != gb {
+		if ga < gb {
+			return -1
+		}
+		return 1
+	}
+	aip, aport := splitEndpoint(a.Local)
+	bip, bport := splitEndpoint(b.Local)
+	if aport != bport {
+		if aport < bport {
+			return -1
+		}
+		return 1
+	}
+	if a.Proto != b.Proto {
+		return strings.Compare(a.Proto, b.Proto)
+	}
+	if c := compareIP(aip, bip); c != 0 {
+		return c
+	}
+	if a.Remote != b.Remote {
+		return strings.Compare(a.Remote, b.Remote)
+	}
+	switch {
+	case a.PID < b.PID:
+		return -1
+	case a.PID > b.PID:
+		return 1
+	}
+	return 0
+}
+
+// splitEndpoint 拆 "地址:端口"，端口转数值；无法解析时端口为 -1。
+func splitEndpoint(s string) (string, int) {
+	host, ps, err := net.SplitHostPort(s)
+	if err != nil {
+		return s, -1
+	}
+	p, err := strconv.Atoi(ps)
+	if err != nil {
+		return host, -1
+	}
+	return host, p
+}
+
+// compareIP 按 IP 数值比较；任一侧解析不了时退回字符串比较。
+func compareIP(a, b string) int {
+	x, y := net.ParseIP(a), net.ParseIP(b)
+	if x == nil || y == nil {
+		return strings.Compare(a, b)
+	}
+	return bytes.Compare(x.To16(), y.To16())
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
