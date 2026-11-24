@@ -96,9 +96,10 @@ func render(a *app.App) {
 		}
 	}
 	b.WriteString(cReset + "\n")
-	// 温度/功耗：只在有读数时显示（机器没有 ACPI 热区是常态）
+	// 温度/功耗：只在有读数时显示（机器没有 ACPI 热区是常态）。
+	// 行标用"硬件"——摘要文本自身以"温度 …"开头，行标再写"温度"会重复。
 	if th := snap.CPU.ThermalText(); th != "" {
-		fmt.Fprintf(&b, "温度  %s\n", th)
+		fmt.Fprintf(&b, "硬件  %s\n", th)
 	}
 
 	used := float64(snap.Mem.PhysTotalB - snap.Mem.PhysAvailB)

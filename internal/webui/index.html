@@ -55,6 +55,7 @@
   #atResult .atHead{padding:6px 0;border-bottom:1px solid var(--border)}
   #atResult .dim,.dim{color:var(--dim)}
   #atResult .warn{color:var(--warn)}
+  #atResult th.on{color:var(--accent)} /* 回溯结果当前按哪一列排序 */
   .conn-bar{display:flex;align-items:center;gap:8px;margin-bottom:6px}
   .conn-bar input{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:6px;
     color:var(--text);padding:4px 8px;font-size:12px;outline:none}
@@ -62,6 +63,9 @@
   .tbl-scroll::-webkit-scrollbar,.inc-scroll::-webkit-scrollbar{width:8px}
   .tbl-scroll::-webkit-scrollbar-thumb,.inc-scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
   .cols{display:grid; grid-template-columns:1fr 1fr; gap:14px}
+  /* 网格子项默认 min-width:auto：表格一宽就不肯收缩，把整页撑出横向滚动条
+     （实测把 1265px 的视口撑到 1482px）。允许收缩后由内部滚动区自己横向滚。 */
+  .cols>section{min-width:0}
   @media(max-width:1100px){.cols{grid-template-columns:1fr}}
 </style>
 </head>
@@ -96,7 +100,7 @@
       <span class="dim" id="connSummary"></span>
     </div>
     <div class="tbl-scroll"><table id="conns"><thead><tr>
-      <th>协议</th><th>本地地址</th><th>对端</th><th>状态</th><th class="num">PID</th><th>进程</th>
+      <th>协议</th><th>本地地址</th><th>对端</th><th>状态</th><th class="num">PID</th><th>进程</th><th>Agent</th>
     </tr></thead><tbody></tbody></table></div>
   </section>
 </div>
@@ -115,11 +119,6 @@
     <div id="incidents" class="inc-scroll"><div class="empty">暂无事件</div></div>
   </section>
 </div>
-
-<section>
-  <h2>健康事件（状态迁移，最近 7 天）</h2>
-  <div id="incidents" class="inc-scroll"><div class="empty">暂无事件</div></div>
-</section>
 
 <footer id="footer"></footer>
 
@@ -206,7 +205,8 @@ function renderCards(){
 const METRICS=[["cpu","CPU"],["memp","内存"],["commit","提交"],["temp","温度"],["power","功耗"],["disk:*","磁盘忙"],["gpu:*","GPU"],["net","网络 MB/s"]];
 function renderChips(){
   $("#metricChips").innerHTML=METRICS.map(m=>`<span class="chip ${METRIC===m[0]?"on":""}" data-m="${m[0]}">${m[1]}</span>`).join("");
-  $("#metricChips").querySelectorAll(".chip").forEach(ch=>ch.onclick=()=>{METRIC=ch.dataset.m;renderChips();drawChart()});
+  // 切换指标后，已固定的回溯结果按新指标就地重排（不重复请求）
+  $("#metricChips").querySelectorAll(".chip").forEach(ch=>ch.onclick=()=>{METRIC=ch.dataset.m;renderChips();drawChart();renderAt()});
   $("#rangeChips").innerHTML=[["300","5分钟"],["1800","30分钟"],["7200","2小时"]].map(r=>
     `<span class="chip ${RANGE==+r[0]?"on":""}" data-r="${r[0]}">${r[1]}</span>`).join("");
   $("#rangeChips").querySelectorAll(".chip").forEach(ch=>ch.onclick=()=>{RANGE=+ch.dataset.r;renderChips();loadAll()});
@@ -246,6 +246,11 @@ function drawChart(){
   // 时间轴固定为所选档位的窗口（右端=现在）：切换档位必然改变坐标；
   // 数据不足窗口时曲线只占左侧一段，采样进度在图例区明示。
   const t1=Date.now(),t0=t1-RANGE*1000;
+  // 切到更短的档位后游标可能落到窗口之外：连同回溯面板一起清除，
+  // 不留一个指向看不见位置的结果（先清状态，不触发重画，避免递归）
+  if(CURSOR.T&&(CURSOR.T<t0||CURSOR.T>t1)){
+    CURSOR={T:0};AT_SEQ++;AT_LAST=null;$("#atResult").innerHTML="";
+  }
   for(let i=0;i<=4;i++){const d=new Date(t0+(t1-t0)*i/4),x=L+(W-L-R)*i/4;
     c.fillText(("0"+d.getHours()).slice(-2)+":"+("0"+d.getMinutes()).slice(-2),x-12,H-8)}
   ss.forEach(s=>{const pts=s.data.filter(p=>p[0]>=t0&&p[0]<=t1);
@@ -286,38 +291,90 @@ function chartTimeAt(ev){
   const t1=Date.now(),t0=t1-RANGE*1000;
   return Math.round(t0+(x-L)/(W-L-R)*(t1-t0));
 }
+// 回溯结果的排序维度跟随趋势图当前指标：看"磁盘忙"时按磁盘 IO 排、看 GPU 时
+// 按 GPU 排——否则切了指标点下去，看到的还是一份按 CPU 排的名单。
+const AT_SORT={
+  cpu:{key:p=>p.cpu||0,col:"cpu",label:"CPU%"},
+  memp:{key:p=>p.priv||0,col:"priv",label:"内存"},
+  commit:{key:p=>p.priv||0,col:"priv",label:"内存"},
+  temp:{key:p=>p.cpu||0,col:"cpu",label:"CPU%"},
+  power:{key:p=>p.cpu||0,col:"cpu",label:"CPU%"},
+  // 进程级网络流量暂无归因：按 CPU 排并在表头注明，不假装是网络排名
+  net:{key:p=>p.cpu||0,col:"cpu",label:"CPU%",note:"进程级网络流量暂无归因，此处按 CPU 排序"},
+};
+function atSorter(){
+  if(AT_SORT[METRIC])return AT_SORT[METRIC];
+  if(METRIC==="disk:*")return {key:p=>(p.rb||0)+(p.wb||0),col:"io",label:"磁盘 读/写"};
+  if(METRIC==="gpu:*")return {key:p=>p.gpu||0,col:"gpu",label:"GPU%"};
+  return AT_SORT.cpu;
+}
+let AT_SEQ=0,AT_LAST=null; // 最近一次回溯结果（切换指标时据此就地重排，不重复请求）
+function renderAt(){
+  const box=$("#atResult"),r=AT_LAST;
+  if(!r||!r.slice){box.innerHTML="";return}
+  const s=r.slice,sorter=atSorter();
+  const procs=(s.procs||[]).slice().sort((a,b)=>sorter.key(b)-sorter.key(a)).slice(0,15);
+  const th=(id,label,cls)=>`<th ${cls?'class="num" ':""}data-col="${id}">${label}</th>`;
+  const rows=procs.map(p=>`<tr>
+    <td class="mono">${p.pid}</td><td title="${esc(p.n)}">${esc(p.n)}</td>
+    <td>${esc(p.a||"")}</td>
+    <td class="num" data-col="cpu">${(p.cpu||0).toFixed(1)}</td>
+    <td class="num" data-col="priv">${fmtB(p.priv)}</td>
+    <td class="num" data-col="io">${fmtB((p.rb||0)+(p.wb||0))}/s</td>
+    <td class="num" data-col="gpu">${p.gpu?(p.gpu||0).toFixed(1):""}</td></tr>`).join("");
+  const when=new Date(s.t);
+  const off=Math.abs(r.deltaMs||0)>=1000?`，取 ${offText(r.deltaMs)}的一拍`:"";
+  // 该时刻的 Agent 账本（服务端取自总量缓冲）：只列有 CPU 占用的前几个
+  const agents=(r.agents||[]).filter(a=>(a.cpu||0)>0).sort((a,b)=>(b.cpu||0)-(a.cpu||0)).slice(0,5)
+    .map(a=>`${esc(a.n)} ${(a.cpu||0).toFixed(1)}%`).join(" · ");
+  box.innerHTML=`<div class="atHead">回溯时刻 <b>${when.toLocaleString("zh-CN",{hour12:false})}</b>${off}
+      <span class="dim">（CPU ${(s.cpu||0).toFixed(1)}% · 内存 ${(s.memp||0).toFixed(1)}% · 按${sorter.label}排序）</span>
+      ${sorter.note?`<div class="dim">${sorter.note}</div>`:""}
+      ${agents?`<div class="dim">当时 Agent：${agents}</div>`:""}</div>
+      <table><thead><tr><th>PID</th><th>进程</th><th>归属</th>${th("cpu","CPU%",1)}${th("priv","内存",1)}${th("io","磁盘 读/写",1)}${th("gpu","GPU%",1)}</tr></thead>
+      <tbody>${rows||'<tr><td colspan="7" class="empty">该时刻无进程记录</td></tr>'}</tbody></table>`;
+  // 标出当前排序的列
+  box.querySelectorAll(`th[data-col="${sorter.col}"]`).forEach(e=>e.classList.add("on"));
+}
+function offText(ms){
+  // 最近的一拍可能在点击时刻之前或之后（刚启动时），方向要如实
+  let s=Math.max(1,Math.round(Math.abs(ms)/1000)),unit="秒";
+  if(s>=60){s=Math.round(s/60);unit="分钟"}
+  return s+unit+(ms>=0?"前":"后");
+}
 async function seekTo(ms){
   if(!ms)return;
   CURSOR={T:ms};
   drawChart();
-  const box=$("#atResult");
+  const box=$("#atResult"),seq=++AT_SEQ;
   box.innerHTML='<span class="empty">读取该时刻的进程…</span>';
   try{
     const r=await(await fetch("/api/at?t="+ms)).json();
+    if(seq!==AT_SEQ)return; // 连点时丢弃过期的响应，避免旧结果覆盖新结果
     if(r.blind){
       // 数据缺失如实说明，不给一个空列表让人误读成"当时没进程"
+      AT_LAST=null;
       box.innerHTML=`<span class="warn">⚠ ${esc(r.reason||"该时刻没有数据")}</span>`;
       return;
     }
-    const s=r.slice||{},procs=s.procs||[];
-    const rows=procs.slice(0,15).map(p=>`<tr>
-      <td class="mono">${p.pid}</td><td title="${esc(p.n)}">${esc(p.n)}</td>
-      <td>${esc(p.a||"")}</td><td class="num">${(p.cpu||0).toFixed(1)}</td>
-      <td class="num">${fmtB(p.priv)}</td>
-      <td class="num">${fmtB((p.rb||0)+(p.wb||0))}/s</td></tr>`).join("");
-    const when=new Date(s.t);
-    box.innerHTML=`<div class="atHead">回溯时刻 <b>${when.toLocaleString("zh-CN",{hour12:false})}</b>
-      <span class="dim">（CPU ${(s.cpu||0).toFixed(1)}% · 内存 ${(s.memp||0).toFixed(1)}%）</span></div>
-      <table><thead><tr><th>PID</th><th>进程</th><th>归属</th><th class="num">CPU%</th><th class="num">内存</th><th class="num">磁盘 读/写</th></tr></thead>
-      <tbody>${rows||'<tr><td colspan="6" class="empty">该时刻无进程记录</td></tr>'}</tbody></table>`;
+    AT_LAST=r;
+    renderAt();
   }catch(e){
+    if(seq!==AT_SEQ)return;
     box.innerHTML=`<span class="warn">回溯失败：${esc(e)}</span>`;
   }
+}
+// 点曲线区域之外（左右留白）= 取消回溯
+function clearSeek(){
+  if(!CURSOR.T)return;
+  AT_SEQ++;AT_LAST=null;CURSOR={T:0};
+  $("#atResult").innerHTML="";
+  drawChart();
 }
 function bindChartSeek(){
   const cv=$("#chart");
   cv.style.cursor="crosshair";
-  cv.addEventListener("click",ev=>seekTo(chartTimeAt(ev)));
+  cv.addEventListener("click",ev=>{const ms=chartTimeAt(ev);ms?seekTo(ms):clearSeek()});
 }
 
 function renderAgents(){
@@ -375,7 +432,7 @@ function renderHeader(){
   const sys=SNAP&&SNAP.sys;
   if(sys)$("#hostline").textContent=`${sys.host} · ${sys.cores} 核 · 开机 ${fmtUp(sys.uptimeSec)} · 采样 ${SNAP.intervalMs>0?SNAP.intervalMs:2000}ms`;
   const errs=[].concat((SNAP&&SNAP.capErrors)||[],(SNAP&&SNAP.errors)||[]);
-  $("#footer").innerHTML=`数据目录 <span class="mono">${esc(sys?sys.dataDir:"")}</span> · ${sys&&sys.record?"历史记录中（totals/procs 按天落盘，retention 14 天）":"未开启记录"} · API：<span class="mono">/api/snapshot /api/history /api/procs /api/incidents</span>`
+  $("#footer").innerHTML=`数据目录 <span class="mono">${esc(sys?sys.dataDir:"")}</span> · ${sys&&sys.record?"历史记录中（totals/procs 按天落盘，retention 14 天）":"未开启记录"} · API：<span class="mono">/api/snapshot /api/history /api/procs /api/conns /api/at /api/incidents /mcp</span>`
     +(errs.length?`<br>采集降级：${errs.map(esc).join("；")}`:"");
 }
 function fmtUp(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+"天":"")+(h?h+"小时":"")+m+"分"}
@@ -407,9 +464,9 @@ async function loadConns(){
 function renderConns(){
   const q=($("#connSearch").value||"").trim().toLowerCase();
   const rows=CONNS.filter(c=>!q||(c.local||"").includes(q)||(c.remote||"").includes(q)||
-    String(c.pid)===q||(c.proc||"").toLowerCase().includes(q));
+    String(c.pid)===q||(c.proc||"").toLowerCase().includes(q)||(c.agent||"").toLowerCase().includes(q));
   const tb=$("#conns tbody");
-  if(!rows.length){tb.innerHTML='<tr><td colspan="6" class="empty">无匹配端点</td></tr>';
+  if(!rows.length){tb.innerHTML='<tr><td colspan="7" class="empty">无匹配端点</td></tr>';
     $("#connSummary").textContent=`共 ${CONNS.length} 条`;return}
   tb.innerHTML=rows.slice(0,300).map(c=>`<tr>
     <td>${esc(c.proto)}</td>
@@ -417,7 +474,8 @@ function renderConns(){
     <td class="mono" title="${esc(c.remote||"")}">${esc(c.remote||"")}</td>
     <td>${esc(c.state||"")}</td>
     <td class="num mono">${c.pid}</td>
-    <td title="${esc(c.proc||"")}">${esc(c.proc||"—")}</td></tr>`).join("");
+    <td title="${esc(c.proc||"")}">${esc(c.proc||"—")}</td>
+    <td>${esc(c.agent||"")}</td></tr>`).join("");
   $("#connSummary").textContent=`显示 ${Math.min(rows.length,300)} / 共 ${CONNS.length} 条`;
 }
 $("#connSearch").addEventListener("input",renderConns);
