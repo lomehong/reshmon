@@ -56,9 +56,11 @@ type App struct {
 	pending    map[string]pendingInc // 挂起中的状态迁移（防抖确认期）
 	lastTickAt time.Time             // 上一个成功 tick 的时刻（冻结看门狗）
 	tickN      int
-	// procSlices 每拍进程概览的环形缓冲，供面板点击趋势图回溯当时进程。
+	// procSlices 进程概览的环形缓冲（抽稀存储，覆盖趋势图最长档），供面板
+	// 点击趋势图回溯当时进程。sliceTick 是到下一次存档的倒计时拍数。
 	procSlices []procSlice
 	sliceAt    int // 下一个写入位置（环形）
+	sliceTick  int // 仅 loop 协程触碰
 
 	stopCh chan struct{}
 	doneCh chan struct{}
@@ -234,9 +236,8 @@ func (a *App) step(baseline bool) {
 
 	a.recordTransitions(rep, snap)
 	a.ring.Push(totals)
-	// 进程切片进内存环形缓冲：面板"点击趋势图某一时刻"回溯当时进程用。
-	// 与落盘切片（每 ProcTicks 拍）不同，这里每拍都留一份概览——
-	// 只存 Top 进程与控制端需要的字段，内存开销可控（ringProcs 拍）。
+	// 进程概览进内存环形缓冲：面板"点击趋势图某一时刻"回溯当时进程用。
+	// 内部抽稀存储（约每 6 秒一份，覆盖趋势图最长档 2 小时），见 atslice.go。
 	a.pushProcSlice(snap)
 
 	if a.writer != nil {
